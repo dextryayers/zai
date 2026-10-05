@@ -1,0 +1,29 @@
+Offline coding and daily assistant
+
+Usage: aicli [OPTIONS] [COMMAND]
+
+Commands:
+  chat      Start or resume interactive chat
+  ask       One shot question with optional RAG
+  code      Coding agent, dry run by default
+  patch     Inspect pending patches
+  run       Run allowlisted shell command
+  index     Index a folder for RAG
+  models    Manage GGUF models
+  daily     Daily overview
+  tasks     Tasks by date
+  notes     Notes search and capture
+  sessions  Sessions list and export
+  config    Config show and set
+  doctor    Diagnostics and benchmarks
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+      --profile <PROFILE>  [default: default]
+      --plain              
+      --json               
+      --quiet              
+      --offline            
+      --verbose            
+  -h, --help               Print help
+  -V, --version            Print version

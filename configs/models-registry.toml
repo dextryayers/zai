@@ -1,0 +1,15 @@
+[[models]]
+id = "qwen2.5-3b-instruct-q4_k_m"
+repo = "Qwen/Qwen2.5-3B-Instruct-GGUF"
+file = "qwen2.5-3b-instruct-q4_k_m.gguf"
+quant = "Q4_K_M"
+size_mb = 1980
+n_ctx = 4096
+
+[[models]]
+id = "llama-3.2-1b-instruct-q4_k_m"
+repo = "meta-llama/Llama-3.2-1B-Instruct-GGUF"
+file = "llama-3.2-1b-instruct-q4_k_m.gguf"
+quant = "Q4_K_M"
+size_mb = 800
+n_ctx = 2048

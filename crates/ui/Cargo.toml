@@ -1,0 +1,12 @@
+[package]
+name = "aicli-ui"
+version = "0.1.0"
+edition = "2021"
+description = "AICLI premium CLI UI primitives"
+
+[dependencies]
+anyhow = { workspace = true }
+nu-ansi-term = { workspace = true }
+indicatif = { workspace = true }
+similar = { workspace = true }
+serde = { workspace = true }

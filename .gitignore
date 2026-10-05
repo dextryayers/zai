@@ -1,0 +1,25 @@
+# AICLI gitignore - Rust workspace, local first
+/target/
+/dist/
+*.bak
+*.aicli.bak.*
+/.benchmark-baselines/
+
+# Local profile data, never commit user state
+/.aicli-test-profile/
+
+# Models and caches, never commit binaries
+*.gguf
+*.onnx
+/.cache/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Env secrets
+.env
+*.pem

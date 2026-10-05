@@ -1,0 +1,16 @@
+[package]
+name = "aicli-models"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+reqwest = { workspace = true }
+sha2 = { workspace = true }
+indicatif = { workspace = true }
+aicli-ui = { path = "../ui" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

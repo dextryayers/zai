@@ -1,0 +1,30 @@
+[package]
+name = "aicli"
+version = "0.3.0"
+edition = "2021"
+description = "AICLI offline coding and daily assistant"
+default-run = "aicli"
+
+[[bin]]
+name = "aicli"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+rustyline = { workspace = true }
+rusqlite = { workspace = true }
+aicli-core = { path = "../core" }
+aicli-ui = { path = "../ui" }
+aicli-ingest = { path = "../ingest" }
+aicli-tools = { path = "../tools" }
+aicli-models = { path = "../models" }
+aicli-infer = { path = "../infer" }
+aicli-rag = { path = "../rag" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

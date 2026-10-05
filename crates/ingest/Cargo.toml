@@ -1,0 +1,16 @@
+[package]
+name = "aicli-ingest"
+version = "0.1.0"
+edition = "2021"
+description = "AICLI file walker and text extract"
+
+[dependencies]
+anyhow = { workspace = true }
+walkdir = { workspace = true }
+ignore = { workspace = true }
+rayon = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
