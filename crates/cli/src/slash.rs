@@ -8,9 +8,11 @@ pub enum Slash {
     Open(String),
     Model(Option<String>),
     Insert {
-        path: String,
+        paths: Vec<String>,
         name: Option<String>,
         ctx: Option<u32>,
+        default: bool,
+        recursive: bool,
     },
     Manage,
     Ollama {
@@ -25,6 +27,7 @@ pub enum Slash {
     Effort(Option<String>),
     Budget,
     Compact,
+    History(Option<usize>),
     Export(Option<String>),
     Sources,
     Clear,
@@ -73,8 +76,13 @@ pub const SLASHES: &[SlashMeta] = &[
     },
     SlashMeta {
         name: "/insert",
-        desc: "Save a GGUF file into the model cache",
-        usage: "/insert <file.gguf> [--name id] [--ctx n]",
+        desc: "Save GGUF file(s) or a folder into the model cache",
+        usage: "/insert <file.gguf> [more...] [--name id] [--ctx n] [--default] [--recursive]",
+    },
+    SlashMeta {
+        name: "/add",
+        desc: "Alias for /insert",
+        usage: "/add <file.gguf> [more...] [--name id] [--ctx n] [--default] [--recursive]",
     },
     SlashMeta {
         name: "/manage",
@@ -110,6 +118,11 @@ pub const SLASHES: &[SlashMeta] = &[
         name: "/compact",
         desc: "Compact history window",
         usage: "/compact",
+    },
+    SlashMeta {
+        name: "/history",
+        desc: "Compact list of recent exchanges",
+        usage: "/history [n]",
     },
     SlashMeta {
         name: "/export",
@@ -203,13 +216,18 @@ pub fn parse(input: &str) -> Option<Slash> {
         "/sessions" => Some(Slash::Sessions),
         "/open" => Some(Slash::Open(parts.join(" "))),
         "/model" => Some(Slash::Model(parts.first().cloned())),
-        "/insert" => {
+        "/insert" | "/add" | "/import" => {
             let name = take_flag(&mut parts, "--name");
             let ctx = take_flag(&mut parts, "--ctx").and_then(|v| v.parse::<u32>().ok());
+            let default = parts.iter().any(|a| a == "--default");
+            let recursive = parts.iter().any(|a| a == "--recursive");
+            parts.retain(|a| a != "--default" && a != "--recursive");
             Some(Slash::Insert {
-                path: parts.first().cloned().unwrap_or_default(),
+                paths: parts,
                 name,
                 ctx,
+                default,
+                recursive,
             })
         }
         "/setting" => {
@@ -238,6 +256,9 @@ pub fn parse(input: &str) -> Option<Slash> {
         "/budget" => Some(Slash::Budget),
         "/ctx" if parts.first().map(|s| s.as_str()) == Some("compact") => Some(Slash::Compact),
         "/compact" => Some(Slash::Compact),
+        "/history" => Some(Slash::History(
+            parts.first().and_then(|v| v.parse::<usize>().ok()),
+        )),
         "/export" => Some(Slash::Export(parts.first().cloned())),
         "/sources" => Some(Slash::Sources),
         "/clear" => Some(Slash::Clear),
@@ -256,9 +277,41 @@ mod tests {
         assert_eq!(
             parse("/insert /tmp/a.gguf --name tiny --ctx 2048"),
             Some(Slash::Insert {
-                path: "/tmp/a.gguf".to_string(),
+                paths: vec!["/tmp/a.gguf".to_string()],
                 name: Some("tiny".to_string()),
                 ctx: Some(2048),
+                default: false,
+                recursive: false,
+            })
+        );
+        assert_eq!(
+            parse("/add a.gguf b.gguf --default"),
+            Some(Slash::Insert {
+                paths: vec!["a.gguf".to_string(), "b.gguf".to_string()],
+                name: None,
+                ctx: None,
+                default: true,
+                recursive: false,
+            })
+        );
+        assert_eq!(
+            parse("/import ~/models --name tiny"),
+            Some(Slash::Insert {
+                paths: vec!["~/models".to_string()],
+                name: Some("tiny".to_string()),
+                ctx: None,
+                default: false,
+                recursive: false,
+            })
+        );
+        assert_eq!(
+            parse("/insert ~/models --recursive"),
+            Some(Slash::Insert {
+                paths: vec!["~/models".to_string()],
+                name: None,
+                ctx: None,
+                default: false,
+                recursive: true,
             })
         );
     }
@@ -311,6 +364,13 @@ mod tests {
         assert_eq!(complete("/").len(), SLASHES.len());
         assert_eq!(closest("/modle"), Some("/model"));
         assert_eq!(closest("/zzz"), None);
+    }
+
+    #[test]
+    fn parses_history() {
+        assert_eq!(parse("/history"), Some(Slash::History(None)));
+        assert_eq!(parse("/history 5"), Some(Slash::History(Some(5))));
+        assert!(complete("/hist").iter().any(|m| m.name == "/history"));
     }
 
     #[test]

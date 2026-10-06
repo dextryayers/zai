@@ -35,6 +35,8 @@ pub struct BackendInfo {
     pub size_bytes: u64,
     pub gguf_version: u32,
     pub tensor_count: u64,
+    pub metadata_kv: u64,
+    pub architecture: Option<String>,
     pub n_ctx: u32,
     pub n_threads: u32,
     pub n_gpu_layers: u32,
@@ -58,19 +60,11 @@ pub fn load_info(
     if md.len() < 32 {
         return Err(InferError::Backend(format!("file too small to be GGUF: {p}")).into());
     }
-    let mut f = std::fs::File::open(path)?;
-    use std::io::Read;
-    let mut hdr = [0u8; 32];
-    f.read_exact(&mut hdr)?;
-    if &hdr[0..4] != b"GGUF" {
-        return Err(InferError::Backend(format!("bad GGUF magic: {p}")).into());
-    }
-    let version = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
-    let tensors = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
-    // Bytes 16..24 are metadata KV count in GGUF v3. Kept for diagnostics.
-    if version == 0 || version > 10 {
-        return Err(InferError::Backend(format!("unsupported GGUF version {version}: {p}")).into());
-    }
+    // Shared deep GGUF reader: magic, version range, tensor and KV counts,
+    // alignment, plus architecture when the metadata section carries it.
+    let info = aicli_models::inspect_gguf(path).map_err(|e| InferError::Backend(format!("{e}")))?;
+    let version = info.version;
+    let tensors = info.tensors;
     // OOM hint: refuse ctx that needs roughly more than 2x file size in RAM estimate.
     // Rough estimate: 1.5 MB per ctx token for 3B class plus file size.
     let need_mb = md.len() / (1024 * 1024) + (n_ctx as u64 * 2) / 1024;
@@ -86,6 +80,8 @@ pub fn load_info(
         size_bytes: md.len(),
         gguf_version: version,
         tensor_count: tensors,
+        metadata_kv: info.metadata_kv,
+        architecture: info.architecture.clone(),
         n_ctx,
         n_threads: if n_threads == 0 {
             default_threads()

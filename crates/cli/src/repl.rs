@@ -152,13 +152,27 @@ pub async fn run_chat(
     // Show recovered stopped turn if last turn was partial.
     let existing = aicli_core::sessions::list_turns(&conn, &session_id)?;
     let recovered = existing.iter().rev().find(|t| t.status == "stopped");
+    let last_line = existing
+        .last()
+        .map(|t| {
+            let first: String = t
+                .content
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(72)
+                .collect();
+            format!("{}: {first}", t.role)
+        })
+        .unwrap_or_else(|| "no exchanges yet".to_string());
     println!(
         "{}",
         aicli_ui::panel::render_panel(
             theme,
             &format!("Session {session_id}"),
             &format!(
-                "Title: {}\nTurns: {} {rec}\nModel {model_id} effort {effort} temp {:.1} seed {}\n/new-chat starts fresh - /clear wipes the view - /help lists all",
+                "Title: {}\nTurns: {} {rec}\nLast: {last_line}\nModel {model_id} effort {effort} temp {:.1} seed {}\n/new-chat starts fresh - /clear wipes the view - /history lists exchanges - /help lists all",
                 sess.title,
                 existing.len(),
                 live_temp(temp, &effort, ctx),
@@ -177,7 +191,6 @@ pub async fn run_chat(
     let mut rl = rustyline::Editor::<SlashCompleter, rustyline::history::DefaultHistory>::new()?;
     rl.set_helper(Some(SlashCompleter));
     let _ = rl.load_history(ctx.paths.history_file.as_path());
-    let mut show_sources = false;
 
     loop {
         let prompt = format!("{} ", theme.accent("❯ zai>"));
@@ -197,7 +210,6 @@ pub async fn run_chat(
                     &conn,
                     &mut session_id,
                     &input,
-                    &mut show_sources,
                     &mut model_id,
                     &mut effort,
                     &mut shell_mode,
@@ -302,16 +314,6 @@ pub async fn run_chat(
                 println!("{}", markdown::render_markdown(theme, &answer));
                 println!("{}", theme.muted("────────────────"));
                 let full = answer;
-                if show_sources {
-                    println!(
-                        "{}",
-                        aicli_ui::panel::render_panel(
-                            theme,
-                            "Sources",
-                            "[1] crates/cli/src/main.rs:1-40 score=0.81"
-                        )
-                    );
-                }
 
                 // Persist assistant turn.
                 let out_tokens = aicli_infer::estimate_tokens(&full) as i64;
@@ -359,13 +361,11 @@ fn live_temp(flag: Option<f32>, effort: &str, ctx: &Ctx) -> f32 {
     aicli_core::config::resolve_temp(flag, ctx.config.model.temp_chat, 0.6, effort)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn handle_slash(
     ctx: &Ctx,
     conn: &rusqlite::Connection,
     session_id: &mut String,
     input: &str,
-    show_sources: &mut bool,
     model_id: &mut String,
     effort: &mut String,
     shell_mode: &mut String,
@@ -382,7 +382,7 @@ async fn handle_slash(
                 aicli_ui::panel::render_panel(
                     theme,
                     "Commands",
-                    "/help /new [title] /new-chat [title] /sessions /open <id> /model [id]\n/manage /ollama <list|pull|rm|show> /insert <file.gguf> /setting [set k v] /effort [level]\n/budget /compact /export [md|json] /sources /plain /clear /quit\nKeys: Up/Down history - Tab completes / - Ctrl+A/E line - Ctrl+U clear line - Ctrl+L clear - Ctrl+R history - Ctrl+C stop - Ctrl+D exit"
+                    "/help /new [title] /new-chat [title] /sessions /open <id> /model [id]\n/manage /ollama <list|pull|rm|show> /insert <file.gguf> [more...] /history [n] /setting [set k v] /effort [level]\n/budget /compact /export [md|json] /sources /plain /clear /quit\nKeys: Up/Down history - Tab completes / - Ctrl+A/E line - Ctrl+U clear line - Ctrl+L clear - Ctrl+R history - Ctrl+C stop - Ctrl+D exit"
                 )
             );
             println!(
@@ -436,13 +436,9 @@ async fn handle_slash(
             Ok(true)
         }
         ["/sources"] => {
-            *show_sources = !*show_sources;
             println!(
                 "{}",
-                theme.muted(&format!(
-                    "sources rail {}",
-                    if *show_sources { "on" } else { "off" }
-                ))
+                theme.muted("this chat has no index attached, use: zai ask \"q\" --show-sources")
             );
             Ok(true)
         }
@@ -477,6 +473,33 @@ async fn handle_slash(
                     turns.len()
                 ))
             );
+            Ok(true)
+        }
+        ["/history", rest @ ..] => {
+            let want: usize = rest
+                .first()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(15)
+                .clamp(1, 100);
+            let turns = aicli_core::sessions::list_turns(conn, session_id).unwrap_or_default();
+            if turns.is_empty() {
+                println!("{}", theme.muted("no exchanges yet in this chat"));
+                return Ok(true);
+            }
+            let start = turns.len().saturating_sub(want);
+            for t in turns.iter().skip(start) {
+                let who = if t.role == "user" { "YOU" } else { "ZAI" };
+                let first: String = t
+                    .content
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(64)
+                    .collect();
+                let hm = t.created_at.get(11..16).unwrap_or("--:--");
+                println!("{hm} {who}: {first}");
+            }
             Ok(true)
         }
         ["/export", rest @ ..] => {
@@ -516,14 +539,7 @@ async fn handle_slash(
             }
             Ok(true)
         }
-        ["/insert", rest @ ..] => {
-            if rest.is_empty() {
-                println!(
-                    "{}",
-                    theme.muted("usage: /insert <file.gguf> [--name id] [--ctx n]")
-                );
-                return Ok(true);
-            }
+        ["/insert", rest @ ..] | ["/add", rest @ ..] | ["/import", rest @ ..] => {
             let mut args: Vec<String> = rest.iter().map(|s| s.to_string()).collect();
             let take = |flag: &str, args: &mut Vec<String>| -> Option<String> {
                 args.iter().position(|a| a == flag).and_then(|i| {
@@ -537,37 +553,129 @@ async fn handle_slash(
             };
             let name = take("--name", &mut args);
             let nctx = take("--ctx", &mut args).and_then(|v| v.parse::<u32>().ok());
-            let src = args.first().cloned().unwrap_or_default();
-            let src = if let Some(stripped) = src.strip_prefix("~/") {
-                std::env::var("HOME")
-                    .map(|h| format!("{h}/{stripped}"))
-                    .unwrap_or(src)
-            } else {
-                src
-            };
-            let src_path = std::path::PathBuf::from(&src);
-            for i in 0..3 {
-                print!(
-                    "\r{}",
-                    progress::spinner_line(theme, i, &format!("insert {}", src_path.display()))
+            let set_default = args.iter().any(|a| a == "--default");
+            let recursive = args.iter().any(|a| a == "--recursive");
+            args.retain(|a| a != "--default" && a != "--recursive");
+            if args.is_empty() {
+                let mut body = String::from(
+                    "usage: /insert <file.gguf> [more...] [--name id] [--ctx n] [--default] [--recursive]\nPass a folder to import every .gguf inside it. Alias: /add.",
                 );
-                use std::io::Write;
-                let _ = std::io::stdout().flush();
-                std::thread::sleep(std::time::Duration::from_millis(60));
+                let mut cands: Vec<std::path::PathBuf> = Vec::new();
+                for dir in aicli_models::default_scan_dirs() {
+                    for p in aicli_models::find_gguf_files(&dir, false)
+                        .into_iter()
+                        .take(4)
+                    {
+                        if !cands.contains(&p) {
+                            cands.push(p);
+                        }
+                        if cands.len() >= 6 {
+                            break;
+                        }
+                    }
+                    if cands.len() >= 6 {
+                        break;
+                    }
+                }
+                if cands.is_empty() {
+                    body.push_str(
+                        "\nno .gguf found in ./models ~/models, try: /insert ~/models/tiny.gguf",
+                    );
+                } else {
+                    body.push_str("\nfound nearby:");
+                    for p in cands {
+                        body.push_str(&format!("\n  {}", p.display()));
+                    }
+                }
+                println!("{}", theme.muted(&body));
+                return Ok(true);
             }
-            println!();
-            match aicli_models::insert_gguf(
-                &ctx.paths.models_dir,
-                &src_path,
-                name.as_deref(),
-                nctx,
-                |_, _| {},
-            ) {
-                Ok(entry) => println!(
+            if args.len() > 1 && name.is_some() {
+                println!(
                     "{}",
-                    theme.ok(&format!("saved {} ({} MB)", entry.id, entry.size_mb))
-                ),
-                Err(e) => println!("{}", theme.danger(&format!("insert failed: {e}"))),
+                    theme.warn("--name only works with a single file, drop it for multi insert")
+                );
+                return Ok(true);
+            }
+            // Expand folders into file lists.
+            let mut files: Vec<std::path::PathBuf> = Vec::new();
+            let mut failed: Vec<String> = Vec::new();
+            for raw in &args {
+                let p = aicli_models::resolve_insert_path(raw);
+                if p.is_dir() {
+                    let found = aicli_models::find_gguf_files(&p, recursive);
+                    if found.is_empty() {
+                        failed.push(format!(
+                            "{}: no .gguf files found, retry with --recursive",
+                            p.display()
+                        ));
+                    } else {
+                        files.extend(found);
+                    }
+                } else if p.exists() {
+                    files.push(p);
+                } else {
+                    failed.push(format!("{p}: file not found", p = p.display()));
+                }
+            }
+            if files.is_empty() {
+                for f in &failed {
+                    println!("{}", theme.danger(&format!("insert failed: {f}")));
+                }
+                return Ok(true);
+            }
+            let mut inserted: Vec<aicli_models::ModelEntry> = Vec::new();
+            for src_path in &files {
+                for i in 0..3 {
+                    print!(
+                        "\r{}",
+                        progress::spinner_line(theme, i, &format!("insert {}", src_path.display()))
+                    );
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                    std::thread::sleep(std::time::Duration::from_millis(60));
+                }
+                println!();
+                match aicli_models::insert_gguf(
+                    &ctx.paths.models_dir,
+                    src_path,
+                    name.as_deref(),
+                    nctx,
+                    |_, _| {},
+                ) {
+                    Ok(entry) => {
+                        println!(
+                            "{}",
+                            theme.ok(&format!(
+                                "saved {} ({} MB, ctx {})",
+                                entry.id, entry.size_mb, entry.n_ctx
+                            ))
+                        );
+                        inserted.push(entry);
+                    }
+                    Err(e) => failed.push(format!("{}: {e}", src_path.display())),
+                }
+            }
+            for f in &failed {
+                println!("{}", theme.danger(&format!("skipped: {f}")));
+            }
+            if inserted.is_empty() {
+                println!("{}", theme.danger("nothing inserted"));
+                return Ok(true);
+            }
+            let cached = aicli_models::list_all(&ctx.paths.models_dir)
+                .iter()
+                .filter(|m| aicli_models::local_path(&ctx.paths.models_dir, m).exists())
+                .count();
+            if set_default || cached <= 1 {
+                if let Some(last) = inserted.last() {
+                    let mut cfg = ctx.config.clone();
+                    cfg.model.default = last.id.clone();
+                    if cfg.save(&ctx.paths.config_file).is_ok() {
+                        *model_id = last.id.clone();
+                        println!("{}", theme.ok(&format!("now default: {}", last.id)));
+                    }
+                }
             }
             Ok(true)
         }
@@ -856,6 +964,8 @@ async fn handle_slash(
                 "/manage",
                 "/ollama",
                 "/insert",
+                "/add",
+                "/history",
                 "/setting",
                 "/effort",
                 "/ctx",

@@ -73,12 +73,17 @@ fn resolve_cached(ctx: &Ctx, model_id: &str, n_ctx: u32) -> Option<String> {
         ctx.config.model.n_threads,
         ctx.config.model.n_gpu_layers,
     ) {
-        Ok(info) => Some(format!(
-            "gguf v{} tensors {} size {} MB",
-            info.gguf_version,
-            info.tensor_count,
-            info.size_bytes / (1024 * 1024)
-        )),
+        Ok(info) => {
+            let arch = info.architecture.as_deref().unwrap_or("unknown arch");
+            Some(format!(
+                "gguf v{} tensors {} kv {} arch {} size {} MB",
+                info.gguf_version,
+                info.tensor_count,
+                info.metadata_kv,
+                arch,
+                info.size_bytes / (1024 * 1024)
+            ))
+        }
         Err(e) => Some(format!("backend warn: {e}")),
     }
 }

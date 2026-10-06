@@ -163,6 +163,24 @@ pub enum Cmd {
         #[command(subcommand)]
         op: MemoryOp,
     },
+    /// Insert local GGUF file(s) into the model cache. Shortcut for models insert.
+    Insert {
+        /// GGUF file(s) or folder(s). Folders are scanned for *.gguf.
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        /// Custom model id. Only allowed with a single file.
+        #[arg(long)]
+        name: Option<String>,
+        /// Context size. Defaults to a size-based suggestion (2048/4096/8192).
+        #[arg(long)]
+        ctx: Option<u32>,
+        /// Set the inserted model as default after insert.
+        #[arg(long, default_value_t = false)]
+        default: bool,
+        /// Scan folders recursively.
+        #[arg(long, default_value_t = false)]
+        recursive: bool,
+    },
     /// Diagnostics and benchmarks
     Doctor {
         #[arg(long, default_value_t = false)]
@@ -198,15 +216,38 @@ pub enum ModelsOp {
     Pull {
         id: String,
     },
+    #[command(aliases = ["add", "import"])]
     Insert {
-        path: PathBuf,
+        /// GGUF file(s) or folder(s). Folders are scanned for *.gguf.
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        /// Custom model id. Only allowed with a single file.
         #[arg(long)]
         name: Option<String>,
+        /// Context size. Defaults to a size-based suggestion (2048/4096/8192).
         #[arg(long)]
         ctx: Option<u32>,
+        /// Set the inserted model as default after insert.
+        #[arg(long, default_value_t = false)]
+        default: bool,
+        /// Scan folders recursively.
+        #[arg(long, default_value_t = false)]
+        recursive: bool,
     },
     Verify {
         id: String,
+    },
+    /// Scan folders for GGUF files. Defaults to cwd, ./models, ~/models.
+    Scan {
+        /// Folders to scan. Empty means the default folders.
+        paths: Vec<PathBuf>,
+        /// Scan folders recursively.
+        #[arg(long, default_value_t = false)]
+        recursive: bool,
+    },
+    /// Read GGUF header metadata: version, tensors, arch, quant, ctx hint.
+    Inspect {
+        path: PathBuf,
     },
     Remove {
         id: String,

@@ -9,12 +9,21 @@ use crate::{
 use anyhow::Result;
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap},
 };
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const SPIN: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Dark theme takeover. Every surface uses these, never the terminal
+/// default, so light terminals can not leak white into the UI.
+const DARK_BG: Color = Color::Rgb(13, 17, 23);
+const DARK_PANEL: Color = Color::Rgb(22, 27, 34);
+
+fn dark_bg() -> Style {
+    Style::default().bg(DARK_BG)
+}
 
 /// Centered welcome art with a unique block font. Rendered on boot
 /// splash and as the first chat banner. Pure ASCII plus box blocks
@@ -30,30 +39,90 @@ const WELCOME_ART: &[&str] = &[
 
 const WELCOME_TITLE: &str = "Welcome to Zai";
 const WELCOME_SUB: &str = "Local-first offline assistant - chat, code, recall";
-const WELCOME_HINTS: &str = "Type a message or press / to see commands - Up/Down picks a command";
-
-fn welcome_text() -> String {
-    let mut s = String::new();
-    for line in WELCOME_ART {
-        s.push_str(line);
-        s.push('\n');
-    }
-    s.push_str(WELCOME_TITLE);
-    s.push('\n');
-    s.push_str(WELCOME_SUB);
-    s.push('\n');
-    s.push_str(WELCOME_HINTS);
-    s
-}
 
 fn welcome_banner_msg() -> String {
-    welcome_text()
-        + "\n\nQuick start:\n"
-        + "  /new-chat [title]  start a fresh chat session\n"
-        + "  /clear             clear entire chat log view\n"
-        + "  /model             list models, Enter switches\n"
-        + "  /help              full command palette\n"
-        + "\nKeys: Ctrl+N new  Ctrl+L clear  Ctrl+P palette  Ctrl+O models  F1 help  F3 rail"
+    "Fresh chat ready - pick an action above, or just type and press Enter.".to_string()
+}
+
+/// Quick start card for the minimal first-run stage. Never plain text:
+/// a bordered panel with the fastest actions plus the ready model line.
+fn quick_card_lines(model_id: &str, n_ctx: u32) -> Vec<Line<'static>> {
+    let row = |a: &str, b: &str| {
+        Line::from(vec![
+            Span::styled(
+                format!(" {a:<9}"),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(b.to_string(), Style::default().fg(Color::Gray)),
+        ])
+    };
+    vec![
+        row("type", "a message, Enter opens your tabs"),
+        row("/model", "switch the AI model"),
+        row("/insert", "add a GGUF file"),
+        row("/help", "all commands, ? works too"),
+        Line::from(vec![
+            Span::styled(
+                format!(" ◆ {} ready", truncate_model(model_id, 30)),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" · ctx {n_ctx}"),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+    ]
+}
+
+/// Centered logo stage for the minimal first-run view.
+/// Pads every line so the block font sits in the middle of the width.
+fn logo_lines(width: u16) -> Vec<Line<'static>> {
+    let w = (width as usize).max(24);
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for art in WELCOME_ART {
+        let pad = (w.saturating_sub(art.chars().count())) / 2;
+        out.push(Line::from(vec![
+            Span::raw(" ".repeat(pad)),
+            Span::styled(
+                art.to_string(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+    let centered = |t: &str, st: Style| {
+        let pad = (w.saturating_sub(t.chars().count())) / 2;
+        Line::from(vec![
+            Span::raw(" ".repeat(pad)),
+            Span::styled(t.to_string(), st),
+        ])
+    };
+    out.push(Line::from(""));
+    out.push(centered(
+        WELCOME_TITLE,
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    ));
+    out.push(centered(WELCOME_SUB, Style::default().fg(Color::DarkGray)));
+    out
+}
+
+/// Shorten a model id from the left so the filename stays visible.
+fn truncate_model(id: &str, max: usize) -> String {
+    let len = id.chars().count();
+    if len <= max {
+        return id.to_string();
+    }
+    format!(
+        "...{}",
+        id.chars().skip(len - (max - 3)).collect::<String>()
+    )
 }
 
 fn new_chat_session(
@@ -101,6 +170,21 @@ struct Msg {
     flat: Vec<(char, Style)>,
     shown: usize,
     done: bool,
+    time: String,
+}
+
+/// Current clock as HH:MM for fresh message headers.
+fn now_hm() -> String {
+    chrono::Local::now().format("%H:%M").to_string()
+}
+
+/// Short HH:MM from an RFC3339 timestamp. Falls back to --:--.
+fn short_hm(ts: &str) -> String {
+    if ts.len() >= 16 {
+        ts[11..16].to_string()
+    } else {
+        "--:--".to_string()
+    }
 }
 
 impl Msg {
@@ -114,6 +198,7 @@ impl Msg {
             flat,
             shown,
             done: true,
+            time: now_hm(),
         }
     }
 
@@ -126,6 +211,7 @@ impl Msg {
             flat,
             shown: 0,
             done: false,
+            time: now_hm(),
         }
     }
 
@@ -182,7 +268,7 @@ fn md_to_lines(input: &str) -> Vec<Line<'static>> {
     let bold = Style::default().add_modifier(Modifier::BOLD);
     let muted = Style::default().fg(Color::DarkGray);
     let cyan = Style::default().fg(Color::Cyan);
-    let code_bg = Style::default().fg(Color::Gray).bg(Color::Black);
+    let code_bg = Style::default().fg(Color::Gray).bg(DARK_PANEL);
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut in_code = false;
     for raw in input.lines() {
@@ -358,13 +444,101 @@ fn load_sessions(ctx: &Ctx) -> Vec<SessionRow> {
         .collect()
 }
 
+/// Strip legacy mock artifacts from old stored turns on display.
+/// Early mock answers embedded a fake fenced block with fn apply_patch
+/// and a fake Sources section citing repo paths. The database keeps the
+/// original bytes untouched, but the chat view renders them cleaned so
+/// old history never looks like internal code. Returns cleaned text plus
+/// whether anything was removed.
+fn clean_legacy_mock(text: &str) -> (String, bool) {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out: Vec<&str> = Vec::new();
+    let mut removed = false;
+    let mut i = 0;
+    while i < lines.len() {
+        let t = lines[i].trim_start();
+        if t.starts_with("```") {
+            let mut j = i + 1;
+            let mut is_legacy = false;
+            while j < lines.len() && !lines[j].trim_start().starts_with("```") {
+                if lines[j].contains("fn apply_patch") {
+                    is_legacy = true;
+                }
+                j += 1;
+            }
+            if is_legacy {
+                removed = true;
+                i = (j + 1).min(lines.len());
+                continue;
+            }
+            out.push(lines[i]);
+            i += 1;
+            continue;
+        }
+        // Legacy fake citation tail: a Sources: line whose remaining
+        // non blank lines all look like the old citation format.
+        if t == "Sources:" {
+            let tail_legacy = lines[i + 1..].iter().all(|l| {
+                let s = l.trim();
+                s.is_empty() || s.contains("crates/") || s.contains("(score") || s.starts_with('-')
+            }) && lines[i + 1..]
+                .iter()
+                .any(|l| l.contains("crates/") || l.contains("(score"));
+            if tail_legacy {
+                removed = true;
+                break;
+            }
+        }
+        out.push(lines[i]);
+        i += 1;
+    }
+    // Collapse runs of blank lines and trim the tail.
+    let mut clean: Vec<&str> = Vec::new();
+    let mut blanks = 0;
+    for l in out {
+        if l.trim().is_empty() {
+            blanks += 1;
+            if blanks <= 1 {
+                clean.push(l);
+            } else {
+                removed = true;
+            }
+        } else {
+            blanks = 0;
+            clean.push(l);
+        }
+    }
+    while clean.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
+        clean.pop();
+    }
+    (clean.join("\n"), removed)
+}
+
+/// Recent turns per session shown on open. Old sessions can hold hundreds
+/// of turns, so only the tail is rendered and the cut is labeled.
+const HISTORY_WINDOW: usize = 20;
+
 fn load_messages(ctx: &Ctx, session_id: &str) -> Vec<Msg> {
     let Ok(conn) = aicli_core::db::open(&ctx.paths.db_file) else {
         return vec![];
     };
-    aicli_core::sessions::list_turns(&conn, session_id)
-        .unwrap_or_default()
+    let turns = aicli_core::sessions::list_turns(&conn, session_id).unwrap_or_default();
+    let total = turns.len();
+    let start = total.saturating_sub(HISTORY_WINDOW);
+    let mut out = Vec::new();
+    if start > 0 {
+        out.push(Msg::full(
+            Role::Sys,
+            &format!(
+                "history: showing last {} of {total} turns - older stays in the database, /export to review",
+                total - start,
+            ),
+        ));
+    }
+    let mut cleaned = 0;
+    let mut rendered: Vec<Msg> = turns
         .into_iter()
+        .skip(start)
         .map(|t| {
             let role = if t.role == "user" {
                 Role::User
@@ -376,9 +550,25 @@ fn load_messages(ctx: &Ctx, session_id: &str) -> Vec<Msg> {
             } else {
                 t.content
             };
-            Msg::full(role, &text)
+            let (text, was) = clean_legacy_mock(&text);
+            if was {
+                cleaned += 1;
+            }
+            let mut m = Msg::full(role, &text);
+            m.time = short_hm(&t.created_at);
+            m
         })
-        .collect()
+        .collect();
+    if cleaned > 0 {
+        out.push(Msg::full(
+            Role::Sys,
+            &format!(
+                "cleaned {cleaned} legacy mock block(s) from old history view - database untouched, new answers never contain them"
+            ),
+        ));
+    }
+    out.append(&mut rendered);
+    out
 }
 
 fn ctx_usage(ctx: &Ctx, session_id: &str, pending_input: &str) -> (usize, u32) {
@@ -404,7 +594,13 @@ fn run_app(ctx: Ctx, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>)
     let mut model_id = ctx.config.model.default.clone();
     let mut effort = ctx.config.model.effort.clone();
     let conn0 = aicli_core::db::open(&ctx.paths.db_file)?;
-    let mut session = aicli_core::sessions::ensure_session(&conn0, None, &model_id)?;
+    // Every fresh launch opens a totally clean chat: reuse the last session
+    // only when it never got a turn, otherwise start a brand new one.
+    // Older chats stay untouched and reachable from the sessions tabs.
+    let mut session = match aicli_core::sessions::last_active(&conn0)? {
+        Some(s) if count_turns(&ctx, &s.id) == 0 => s,
+        _ => aicli_core::sessions::create_session(&conn0, "", &model_id)?,
+    };
     drop(conn0);
     let mut sessions = load_sessions(&ctx);
     let mut sess_sel: usize = sessions
@@ -436,6 +632,10 @@ fn run_app(ctx: Ctx, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>)
     let mut insert_rx: Option<mpsc::Receiver<InsertMsg>> = None;
     let boot_until = Instant::now() + Duration::from_millis(600);
     let mut tick: usize = 0;
+    let mut chat_turns = count_turns(&ctx, &session.id);
+    let mut usage_session = session.id.clone();
+    // Context meter cache: recomputed roughly once a second or on input.
+    let mut usage_cache: Option<(usize, u32, usize, String)> = None;
 
     loop {
         tick += 1;
@@ -474,26 +674,44 @@ fn run_app(ctx: Ctx, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>)
                     &prompt,
                     ctx.config.model.n_ctx,
                 );
-                persist_turns(&ctx, &session.id, q, &routed.text, "done");
                 messages.push(Msg::streaming(Role::Zai, &routed.text));
+                // Truthful provenance line instead of fake citations.
+                // Only shown when the sources rail is on.
+                if show_sources {
+                    messages.push(Msg::full(
+                        Role::Sys,
+                        &format!("via {}", routed.backend_note),
+                    ));
+                }
                 pending = Some(Pending::Streaming);
                 follow = true;
             }
         }
-        // Advance streaming reveal.
+        // Advance streaming reveal on the newest unfinished message.
+        // Scans from the tail so trailing done notes never block it.
+        // The user turn is already persisted at submit time, so an
+        // interrupted stream only needs the assistant side saved.
         let mut stream_done = false;
-        for m in messages.iter_mut().rev().take(1) {
+        let mut finished_text: Option<String> = None;
+        for m in messages.iter_mut().rev() {
             if !m.done {
                 m.shown = (m.shown + 8).min(m.flat.len());
                 if m.shown >= m.flat.len() {
                     m.done = true;
                     stream_done = true;
+                    if m.role == Role::Zai {
+                        finished_text = Some(flat_text(m));
+                    }
                 }
                 break;
             }
         }
         if stream_done {
             pending = None;
+            if let Some(t) = finished_text {
+                persist_assistant(&ctx, &session.id, &t, "done");
+                chat_turns += 2;
+            }
         }
         // Insert progress pump.
         if let Some(rx) = insert_rx.as_ref() {
@@ -509,22 +727,50 @@ fn run_app(ctx: Ctx, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>)
                             *total = t;
                         }
                     }
-                    InsertMsg::Done(Ok(entry)) => {
+                    InsertMsg::DoneMany(inserted, failed, default_id) => {
                         overlay = Overlay::None;
-                        toast = Some((
-                            format!("saved model {} ({} MB)", entry.id, entry.size_mb),
-                            Instant::now(),
-                        ));
-                        model_id = entry.id.clone();
-                        persist_model(&ctx, &entry.id);
-                    }
-                    InsertMsg::Done(Err(e)) => {
-                        overlay = Overlay::Insert {
-                            label: "insert failed".to_string(),
-                            done: 0,
-                            total: 1,
-                            finished: Some(format!("error: {e}")),
-                        };
+                        if inserted.len() == 1 {
+                            // Single insert takes over as the active model.
+                            if let Some(e) = inserted.first() {
+                                model_id = e.id.clone();
+                                persist_model(&ctx, &e.id);
+                            }
+                        } else if let Some(d) = &default_id {
+                            model_id = d.clone();
+                        }
+                        if inserted.is_empty() {
+                            messages.push(Msg::full(
+                                Role::Sys,
+                                &format!(
+                                    "insert failed:\n{}",
+                                    failed.join("\n").chars().take(800).collect::<String>()
+                                ),
+                            ));
+                            toast = Some(("insert failed".to_string(), Instant::now()));
+                        } else {
+                            let mut body = inserted
+                                .iter()
+                                .map(|e| {
+                                    format!("saved {} ({} MB, ctx {})", e.id, e.size_mb, e.n_ctx)
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            if !failed.is_empty() {
+                                body.push_str(&format!(
+                                    "\nskipped:\n{}",
+                                    failed.join("\n").chars().take(500).collect::<String>()
+                                ));
+                            }
+                            if let Some(d) = &default_id {
+                                body.push_str(&format!("\nnow default: {d}"));
+                            }
+                            messages.push(Msg::full(Role::Sys, &body));
+                            toast = Some((
+                                format!("saved {} model(s)", inserted.len()),
+                                Instant::now(),
+                            ));
+                            sessions = load_sessions(&ctx);
+                        }
                     }
                     InsertMsg::DonePull(Ok(name)) => {
                         overlay = Overlay::None;
@@ -542,12 +788,52 @@ fn run_app(ctx: Ctx, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>)
             }
         }
 
-        let (used, total) = ctx_usage(&ctx, &session.id, &input);
+        // Session switch detection: refresh the turn counter and drop
+        // the meter cache so the new chat reads exact from the database.
+        if usage_session != session.id {
+            usage_session = session.id.clone();
+            chat_turns = count_turns(&ctx, &session.id);
+            usage_cache = None;
+        }
+        // Context meter is cached: full history scan roughly once a
+        // second or when the input changes, never every frame.
+        let stale = match &usage_cache {
+            Some((_, _, at, snap)) => tick - *at > 24 || *snap != input,
+            None => true,
+        };
+        if stale {
+            let (u, t) = ctx_usage(&ctx, &session.id, &input);
+            usage_cache = Some((u, t, tick, input.clone()));
+        }
+        let (used, total) = match &usage_cache {
+            Some((u, t, _, _)) => (*u, *t),
+            None => (0, ctx.config.model.n_ctx),
+        };
         terminal.draw(|f| {
             draw(
-                f, &ctx, version, &model_id, &effort, used, total, &sessions, sess_sel, &messages,
-                &input, cursor, slash_sel, &overlay, &toast, &pending, scroll, follow, focus_left,
-                tick, boot_until,
+                f,
+                &ctx,
+                version,
+                &model_id,
+                &effort,
+                used,
+                total,
+                &sessions,
+                sess_sel,
+                &messages,
+                &input,
+                cursor,
+                slash_sel,
+                &overlay,
+                &toast,
+                &pending,
+                scroll,
+                follow,
+                focus_left,
+                tick,
+                boot_until,
+                &session.id,
+                chat_turns,
             );
         })?;
 
@@ -557,10 +843,30 @@ fn run_app(ctx: Ctx, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>)
                     use crossterm::event::{KeyCode, KeyModifiers};
                     match (key.code, key.modifiers) {
                         (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
-                            if pending.is_some() {
-                                mark_stopped(&ctx, &session.id);
-                                pending = None;
-                                messages.push(Msg::full(Role::Sys, "stopped, partial kept"));
+                            match &pending {
+                                // Cancelled while thinking: the question is
+                                // already persisted, nothing partial exists.
+                                Some(Pending::Thinking { .. }) => {
+                                    pending = None;
+                                    messages.push(Msg::full(
+                                        Role::Sys,
+                                        "cancelled before the answer started",
+                                    ));
+                                }
+                                // Cancelled mid stream: save the real visible
+                                // prefix as a stopped turn, then freeze it.
+                                Some(Pending::Streaming) => {
+                                    if let Some(m) = messages.iter_mut().rev().find(|x| !x.done) {
+                                        let part = partial_text(m);
+                                        m.shown = m.flat.len();
+                                        m.done = true;
+                                        persist_assistant(&ctx, &session.id, &part, "stopped");
+                                        chat_turns += 1;
+                                    }
+                                    pending = None;
+                                    messages.push(Msg::full(Role::Sys, "stopped, partial kept"));
+                                }
+                                None => {}
                             }
                             continue;
                         }
@@ -687,18 +993,48 @@ fn draw(
     focus_left: bool,
     tick: usize,
     boot_until: Instant,
+    session_id: &str,
+    session_turns: usize,
 ) {
     let area = f.area();
+    // Black stage base so the whole UI sits on black in every terminal.
+    f.buffer_mut().set_style(area, dark_bg());
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Min(1),
             Constraint::Length(3),
+            Constraint::Length(1),
         ])
         .split(area);
 
-    // Premium status bar with segmented style and ctx meter.
+    // View mode: minimal logo plus chat column until the first user message
+    // appears, full tabbed view afterwards. Derived every frame, no flag.
+    let minimal = !messages.iter().any(|m| m.role == Role::User);
+    let show_rail = !minimal || focus_left;
+
+    // Slim brand line on top. Model facts live in the model bar below chat.
+    let top_line = Line::from(vec![
+        Span::styled(
+            " ZAI ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(format!("v{version}"), Style::default().fg(Color::DarkGray)),
+        Span::styled("  ● offline ", Style::default().fg(Color::Green)),
+        Span::styled(
+            format!("▣ {}", ctx.paths.profile),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled("  F1 help", Style::default().fg(Color::DarkGray)),
+    ]);
+    f.render_widget(Paragraph::new(top_line), rows[0]);
+
+    // Context meter shared by the model bar below the chat column.
     let pct = if total > 0 {
         used * 100 / total.max(1) as usize
     } else {
@@ -715,107 +1051,147 @@ fn draw(
     let bar: String = (0..10)
         .map(|i| if i < bar_fill { '#' } else { '-' })
         .collect();
-    let status_line = Line::from(vec![
-        Span::styled(
-            " ZAI ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-        Span::styled(format!("v{version}"), Style::default().fg(Color::DarkGray)),
-        Span::styled("  ◆ ", Style::default().fg(Color::Cyan)),
-        Span::styled(
-            model_id.to_string(),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("  ⚡ {effort}"),
-            Style::default().fg(Color::Magenta),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!("ctx {used}/{total} {pct}% [{bar}]"),
-            Style::default().fg(ctx_color),
-        ),
-        Span::styled("  ● offline ", Style::default().fg(Color::Green)),
-        Span::styled(
-            format!("▣ {}", ctx.paths.profile),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]);
-    f.render_widget(Paragraph::new(status_line), rows[0]);
 
-    // Body columns.
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(30), Constraint::Min(1)])
-        .split(rows[1]);
-
-    // Left: sessions with premium active marker.
-    let items: Vec<ListItem> = sessions
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            let head: String = s.title.chars().take(20).collect();
-            let head = if head.trim().is_empty() {
-                s.id.clone()
-            } else {
-                head
-            };
-            let active = i == sess_sel.min(sessions.len().saturating_sub(1));
-            let marker = if active { "● " } else { "○ " };
-            let title_style = if active {
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-            ListItem::new(vec![
-                Line::from(vec![
-                    Span::styled(
-                        marker.to_string(),
-                        Style::default().fg(if active { Color::Cyan } else { Color::DarkGray }),
-                    ),
-                    Span::styled(head, title_style),
-                ]),
-                Line::from(Span::styled(
-                    format!("  {} turns", s.turns),
-                    Style::default().fg(Color::DarkGray),
-                )),
-            ])
-        })
-        .collect();
-    let left_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
-        .title(if focus_left {
-            " ● Sessions - Alt+2 to chat "
-        } else {
-            " ○ Sessions - Alt+1 to focus "
-        })
-        .border_style(Style::default().fg(if focus_left {
-            Color::Cyan
-        } else {
-            Color::DarkGray
-        }));
-    let mut state = ListState::default();
-    state.select(Some(sess_sel.min(sessions.len().saturating_sub(1))));
-    f.render_stateful_widget(
-        List::new(items)
-            .block(left_block)
-            .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
-            .highlight_symbol("> "),
-        cols[0],
-        &mut state,
+    // Content column: centered like OpenCode, max 124 wide with gutters
+    // on wide terminals. Top brand line stays full width.
+    let content_w = area.width.min(124);
+    let content_x = area.x + area.width.saturating_sub(content_w) / 2;
+    let content = Rect::new(
+        content_x,
+        rows[1].y,
+        content_w,
+        area.height.saturating_sub(rows[1].y),
     );
+    let crows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .split(content);
+
+    // Body: tabbed columns in full mode, logo stage plus full width chat
+    // column in minimal mode.
+    let chat_area: Rect = if show_rail {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(30), Constraint::Min(1)])
+            .split(crows[0]);
+
+        // Left: sessions with premium active marker.
+        let items: Vec<ListItem> = sessions
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let head: String = s.title.chars().take(20).collect();
+                let head = if head.trim().is_empty() {
+                    s.id.clone()
+                } else {
+                    head
+                };
+                let active = i == sess_sel.min(sessions.len().saturating_sub(1));
+                let marker = if active { "● " } else { "○ " };
+                let title_style = if active {
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
+                ListItem::new(vec![
+                    Line::from(vec![
+                        Span::styled(
+                            marker.to_string(),
+                            Style::default().fg(if active { Color::Cyan } else { Color::DarkGray }),
+                        ),
+                        Span::styled(head, title_style),
+                    ]),
+                    Line::from(Span::styled(
+                        format!("  {} turns", s.turns),
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                ])
+            })
+            .collect();
+        let left_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .title(if focus_left {
+                " ● Sessions - Alt+2 to chat "
+            } else {
+                " ○ Sessions - Alt+1 to focus "
+            })
+            .border_style(Style::default().fg(if focus_left {
+                Color::Cyan
+            } else {
+                Color::DarkGray
+            }));
+        let mut state = ListState::default();
+        state.select(Some(sess_sel.min(sessions.len().saturating_sub(1))));
+        f.render_stateful_widget(
+            List::new(items)
+                .block(left_block)
+                .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+                .highlight_symbol("> "),
+            cols[0],
+            &mut state,
+        );
+        cols[1]
+    } else {
+        // Minimal stage: hero logo plus a quick start card above a full
+        // width chat column. Never a plain screen. Short terminals fall
+        // back to the boxed logo, tiny ones to chat only.
+        let body_h = crows[0].height;
+        if body_h >= 19 {
+            let stage = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(9),
+                    Constraint::Length(7),
+                    Constraint::Min(1),
+                ])
+                .split(crows[0]);
+            f.render_widget(Paragraph::new(logo_lines(stage[0].width)), stage[0]);
+            let card_w = stage[1].width.min(62);
+            let card_x = stage[1].x + stage[1].width.saturating_sub(card_w) / 2;
+            let card = Rect::new(card_x, stage[1].y, card_w, 7.min(stage[1].height));
+            clear_black(f, card);
+            f.render_widget(
+                Paragraph::new(quick_card_lines(model_id, ctx.config.model.n_ctx)).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(ratatui::widgets::BorderType::Rounded)
+                        .title(" Quick start ")
+                        .border_style(Style::default().fg(Color::Cyan)),
+                ),
+                card,
+            );
+            stage[2]
+        } else if body_h >= 13 {
+            let stage = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(11), Constraint::Min(1)])
+                .split(crows[0]);
+            f.render_widget(
+                Paragraph::new(logo_lines(stage[0].width)).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(ratatui::widgets::BorderType::Rounded)
+                        .title(" ZAI ")
+                        .border_style(Style::default().fg(Color::Cyan)),
+                ),
+                stage[0],
+            );
+            stage[1]
+        } else {
+            crows[0]
+        }
+    };
 
     // Main: premium message cards. User input uses green YOU card,
     // AI answer uses cyan ZAI card with unique styling, system is muted.
+    // Each card header carries the turn time so long histories stay clear.
     let mut lines: Vec<Line<'static>> = Vec::new();
     for m in messages {
         match m.role {
@@ -827,7 +1203,8 @@ fn draw(
                             .fg(Color::Green)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled("────────────────", Style::default().fg(Color::DarkGray)),
+                    Span::styled(m.time.clone(), Style::default().fg(Color::DarkGray)),
+                    Span::styled(" ────────────────", Style::default().fg(Color::DarkGray)),
                 ]));
                 for l in m.visible() {
                     let mut spans = vec![Span::styled(
@@ -847,7 +1224,8 @@ fn draw(
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled("────────────────", Style::default().fg(Color::DarkGray)),
+                    Span::styled(m.time.clone(), Style::default().fg(Color::DarkGray)),
+                    Span::styled(" ────────────────", Style::default().fg(Color::DarkGray)),
                 ]));
                 for l in m.visible() {
                     let mut spans = vec![Span::styled(
@@ -885,25 +1263,30 @@ fn draw(
         ]));
     }
     let total_lines = lines.len() as u16;
-    let view_h = cols[1].height.saturating_sub(2);
+    let view_h = chat_area.height.saturating_sub(2);
     let offset = if follow {
         total_lines.saturating_sub(view_h)
     } else {
         scroll.min(total_lines.saturating_sub(1))
     };
     let scroll_tag = if follow { "" } else { " - PgDn to follow " };
+    let chat_title = if minimal {
+        " Chat - type a message, Enter opens tabs ".to_string()
+    } else {
+        format!(" ◆ Chat{scroll_tag} ")
+    };
     f.render_widget(
         Paragraph::new(lines)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(ratatui::widgets::BorderType::Rounded)
-                    .title(format!(" ◆ Chat{scroll_tag} "))
+                    .title(chat_title)
                     .border_style(Style::default().fg(Color::DarkGray)),
             )
             .wrap(Wrap { trim: false })
             .scroll((offset, 0)),
-        cols[1],
+        chat_area,
     );
 
     // Premium input with placeholder and shortcut hints.
@@ -942,9 +1325,13 @@ fn draw(
                 .borders(Borders::ALL)
                 .border_type(ratatui::widgets::BorderType::Rounded)
                 .title(if focus_left {
-                    " Input - Tab returns to chat "
+                    " Input - Tab returns to chat ".to_string()
                 } else {
-                    " Input - / commands - Ctrl+N new - Ctrl+L clear - F1 help "
+                    format!(
+                        " Input {}/{} - / commands - Ctrl+N new - Ctrl+L clear - F1 help ",
+                        cursor,
+                        input.chars().count()
+                    )
                 })
                 .border_style(Style::default().fg(if focus_left {
                     Color::DarkGray
@@ -952,8 +1339,68 @@ fn draw(
                     Color::Cyan
                 })),
         ),
-        rows[2],
+        crows[1],
     );
+    // Model bar: always below the chat column, first frame to last.
+    // The active AI model never leaves this strip. Rich on wide screens,
+    // compact on narrow ones, never overflowing.
+    let sess_short: String = session_id.chars().take(8).collect();
+    let model_meta = aicli_models::find_any(&ctx.paths.models_dir, model_id)
+        .map(|e| format!("{} · {} MB", e.quant, e.size_mb))
+        .unwrap_or_default();
+    let wide = crows[2].width >= 100;
+    let model_bar = if wide {
+        Line::from(vec![
+            Span::styled(
+                " ◆ ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                truncate_model(model_id, 28),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  {model_meta}"), Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("  ⚡ {effort}"),
+                Style::default().fg(Color::Magenta),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("ctx {used}/{total} {pct}% [{bar}]"),
+                Style::default().fg(ctx_color),
+            ),
+            Span::styled(
+                format!("  ▣ {} {session_turns}t {sess_short}", ctx.paths.profile),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(
+                " ◆ ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                truncate_model(model_id, 20),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(format!("ctx {pct}%"), Style::default().fg(ctx_color)),
+            Span::styled(
+                format!("  {session_turns}t"),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    };
+    f.render_widget(Paragraph::new(model_bar), crows[2]);
     if input.starts_with('/') && !input.contains(' ') {
         let matches = slash::complete(input);
         if !matches.is_empty() {
@@ -998,8 +1445,8 @@ fn draw(
                 .collect();
             let w = 68u16.min(area.width.saturating_sub(4));
             let h = (items.len() as u16 + 2).min(12);
-            let popup = Rect::new(area.x + 2, rows[2].y.saturating_sub(h), w, h);
-            f.render_widget(Clear, popup);
+            let popup = Rect::new(area.x + 2, crows[1].y.saturating_sub(h), w, h);
+            clear_black(f, popup);
             f.render_widget(
                 List::new(items).block(
                     Block::default()
@@ -1030,11 +1477,16 @@ fn draw(
                 ("Ctrl+N", "new chat"),
                 ("Ctrl+L", "clear log"),
                 ("Ctrl+P/F1", "this palette"),
+                ("?", "help when input empty"),
                 ("Ctrl+O/F2", "models"),
                 ("Ctrl+E", "effort"),
                 ("Ctrl+B", "budget"),
                 ("Ctrl+S", "settings"),
                 ("Ctrl+U", "clear input"),
+                ("Ctrl+A/Home", "line start"),
+                ("Ctrl+K", "kill to cursor end"),
+                ("Ctrl+W", "delete word back"),
+                ("End/Delete", "line end / forward delete"),
                 ("Up/Down", "pick / command or history"),
                 ("Tab/Enter", "apply command"),
                 ("PgUp/PgDn", "scroll chat"),
@@ -1089,7 +1541,7 @@ fn draw(
             let h = body.lines().count() as u16 + 4;
             let w = 62u16.min(area.width.saturating_sub(4));
             let popup = centered(area, w, h.min(area.height.saturating_sub(4)));
-            f.render_widget(Clear, popup);
+            clear_black(f, popup);
             f.render_widget(
                 Paragraph::new(body).block(
                     Block::default()
@@ -1182,7 +1634,7 @@ fn draw(
                 format!("{label}\n{done}/{total} bytes")
             };
             let popup = centered(area, 56.min(area.width.saturating_sub(4)), 7);
-            f.render_widget(Clear, popup);
+            clear_black(f, popup);
             let inner = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(3), Constraint::Length(2)])
@@ -1199,6 +1651,13 @@ fn draw(
             f.render_widget(
                 Gauge::default()
                     .block(Block::default().borders(Borders::ALL))
+                    .style(dark_bg())
+                    .gauge_style(
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .bg(DARK_BG)
+                            .add_modifier(Modifier::BOLD),
+                    )
                     .ratio(ratio.clamp(0.0, 1.0)),
                 inner[1],
             );
@@ -1214,7 +1673,7 @@ fn draw(
             w,
             3,
         );
-        f.render_widget(Clear, popup);
+        clear_black(f, popup);
         f.render_widget(
             Paragraph::new(msg.clone()).block(Block::default().borders(Borders::ALL)),
             popup,
@@ -1225,7 +1684,7 @@ fn draw(
     if Instant::now() < boot_until {
         let frame = SPIN[tick % SPIN.len()];
         let popup = centered(area, 52.min(area.width.saturating_sub(4)), 13);
-        f.render_widget(Clear, popup);
+        clear_black(f, popup);
         let mut splash: Vec<Line> = WELCOME_ART
             .iter()
             .map(|l| {
@@ -1270,13 +1729,19 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
     Rect::new(x, y, w.min(area.width), h.min(area.height))
 }
 
+/// Clear a popup area and force it black, so overlays never flash the
+/// terminal default background in the middle of the black stage.
+fn clear_black(f: &mut Frame, area: Rect) {
+    f.buffer_mut().set_style(area, dark_bg());
+}
+
 fn popup_list(f: &mut Frame, area: Rect, title: &str, rows: &[ListItem], sel: Option<usize>) {
     let h = (rows.len() as u16 + 2)
         .min(area.height.saturating_sub(4))
         .max(4);
     let w = 64u16.min(area.width.saturating_sub(4));
     let popup = centered(area, w, h);
-    f.render_widget(Clear, popup);
+    clear_black(f, popup);
     let mut state = ListState::default();
     state.select(sel);
     f.render_stateful_widget(
@@ -1387,7 +1852,9 @@ fn persist_model(ctx: &Ctx, id: &str) {
     let _ = cfg.save(&ctx.paths.config_file);
 }
 
-fn persist_turns(ctx: &Ctx, session_id: &str, input: &str, answer: &str, status: &str) {
+/// Persist the user turn the moment Enter is pressed, so an interrupted
+/// answer never loses the question from history.
+fn persist_user(ctx: &Ctx, session_id: &str, input: &str) {
     if let Ok(conn) = aicli_core::db::open(&ctx.paths.db_file) {
         if let Ok(t) = aicli_core::sessions::append_turn(
             &conn,
@@ -1400,6 +1867,12 @@ fn persist_turns(ctx: &Ctx, session_id: &str, input: &str, answer: &str, status:
         ) {
             let _ = aicli_core::sessions::mirror_append(&ctx.paths.sessions_dir, &t);
         }
+    }
+}
+
+/// Persist the assistant turn with its final status, done or stopped.
+fn persist_assistant(ctx: &Ctx, session_id: &str, answer: &str, status: &str) {
+    if let Ok(conn) = aicli_core::db::open(&ctx.paths.db_file) {
         if let Ok(t) = aicli_core::sessions::append_turn(
             &conn,
             session_id,
@@ -1414,22 +1887,28 @@ fn persist_turns(ctx: &Ctx, session_id: &str, input: &str, answer: &str, status:
     }
 }
 
-fn mark_stopped(ctx: &Ctx, session_id: &str) {
-    if let Ok(conn) = aicli_core::db::open(&ctx.paths.db_file) {
-        if let Ok(turns) = aicli_core::sessions::list_turns(&conn, session_id) {
-            if let Some(last) = turns.last() {
-                let _ = conn.execute(
-                    "UPDATE turns SET status='stopped' WHERE id=?1",
-                    [last.id.clone()],
-                );
-            }
-        }
-    }
+/// Full text of a message from its flattened chars.
+fn flat_text(m: &Msg) -> String {
+    m.flat.iter().map(|(ch, _)| *ch).collect()
+}
+
+/// Visible prefix of a streaming message, used for real partial saves.
+fn partial_text(m: &Msg) -> String {
+    m.flat.iter().take(m.shown).map(|(ch, _)| *ch).collect()
+}
+
+/// Turn count for one session, used for the model bar tag.
+fn count_turns(ctx: &Ctx, session_id: &str) -> usize {
+    aicli_core::db::open(&ctx.paths.db_file)
+        .ok()
+        .and_then(|c| aicli_core::sessions::list_turns(&c, session_id).ok())
+        .map(|v| v.len())
+        .unwrap_or(0)
 }
 
 enum InsertMsg {
     Progress(u64, u64),
-    Done(Result<aicli_models::ModelEntry, String>),
+    DoneMany(Vec<aicli_models::ModelEntry>, Vec<String>, Option<String>),
     DonePull(Result<String, String>),
 }
 
@@ -1493,6 +1972,11 @@ fn handle_key(
                     format!("focus {}", if *focus_left { "sessions" } else { "chat" }),
                     Instant::now(),
                 ));
+                return Ok(true);
+            }
+            // Bare ? opens help, mirroring the palette shortcut.
+            KeyCode::Char('?') if input.is_empty() => {
+                *overlay = Overlay::Help;
                 return Ok(true);
             }
             _ => {}
@@ -1698,11 +2182,23 @@ fn handle_key(
                         if let Ok(Some(s)) = aicli_core::sessions::get_session(&conn, &row.id) {
                             *session = s;
                             *messages = load_messages(ctx, &session.id);
+                            if messages.is_empty() {
+                                messages.push(Msg::full(Role::Sys, &welcome_banner_msg()));
+                            }
                             *follow = true;
                             *focus_left = false;
                         }
                     }
                 }
+                return Ok(true);
+            }
+            // Never swallow a message while an answer streams. Keep the
+            // input intact and say why instead of dropping it silently.
+            if pending.is_some() {
+                *toast = Some((
+                    "busy - answer streaming, Enter queues nothing, Ctrl+C stops".to_string(),
+                    Instant::now(),
+                ));
                 return Ok(true);
             }
             let text = input.trim().to_string();
@@ -1715,7 +2211,7 @@ fn handle_key(
             *cursor = 0;
             *slash_sel = None;
             *follow = true;
-            submit(
+            let cont = submit(
                 ctx,
                 &text,
                 session,
@@ -1728,7 +2224,14 @@ fn handle_key(
                 effort,
                 overlay,
                 insert_rx,
-            )
+            )?;
+            // Session switching commands replace the active session.
+            // Resync the highlight so the rail never points elsewhere.
+            *sess_sel = sessions
+                .iter()
+                .position(|s| s.id == session.id)
+                .unwrap_or(*sess_sel);
+            Ok(cont)
         }
         KeyCode::Backspace => {
             if *cursor > 0 {
@@ -1738,6 +2241,46 @@ fn handle_key(
                 *cursor -= 1;
                 *slash_sel = Some(0);
             }
+            Ok(true)
+        }
+        KeyCode::Delete => {
+            let len = input.chars().count();
+            if *cursor < len {
+                let mut chars: Vec<char> = input.chars().collect();
+                chars.remove(*cursor);
+                *input = chars.into_iter().collect();
+            }
+            Ok(true)
+        }
+        KeyCode::Home => {
+            *cursor = 0;
+            Ok(true)
+        }
+        KeyCode::End => {
+            *cursor = input.chars().count();
+            Ok(true)
+        }
+        KeyCode::Char('a') if mods.contains(KeyModifiers::CONTROL) => {
+            *cursor = 0;
+            Ok(true)
+        }
+        KeyCode::Char('k') if mods.contains(KeyModifiers::CONTROL) => {
+            let kept: String = input.chars().take(*cursor).collect();
+            *input = kept;
+            Ok(true)
+        }
+        KeyCode::Char('w') if mods.contains(KeyModifiers::CONTROL) => {
+            let mut chars: Vec<char> = input.chars().collect();
+            let mut end = (*cursor).min(chars.len());
+            while end > 0 && chars[end - 1] == ' ' {
+                end -= 1;
+            }
+            while end > 0 && chars[end - 1] != ' ' {
+                end -= 1;
+            }
+            chars.drain(end..*cursor);
+            *input = chars.into_iter().collect();
+            *cursor = end;
             Ok(true)
         }
         KeyCode::Left => {
@@ -2049,6 +2592,9 @@ fn submit(
                         Ok(Some(s)) => {
                             *session = s;
                             *messages = load_messages(ctx, &session.id);
+                            if messages.is_empty() {
+                                messages.push(Msg::full(Role::Sys, &welcome_banner_msg()));
+                            }
                         }
                         _ => messages.push(Msg::full(
                             Role::Sys,
@@ -2077,17 +2623,23 @@ fn submit(
                 }
             }
             Slash::Insert {
-                path,
+                paths,
                 name,
                 ctx: nctx,
+                default,
+                recursive,
             } => {
-                if path.is_empty() {
+                if paths.is_empty() {
+                    messages.push(Msg::full(Role::Sys, &insert_help()));
+                } else if paths.len() > 1 && name.is_some() {
                     messages.push(Msg::full(
                         Role::Sys,
-                        "usage: /insert <file.gguf> [--name id] [--ctx n]",
+                        "--name only works with a single file, drop it for multi insert",
                     ));
                 } else {
-                    start_insert(ctx, &path, name, nctx, overlay, insert_rx);
+                    start_insert(
+                        ctx, &paths, name, nctx, default, recursive, overlay, insert_rx,
+                    );
                 }
             }
             Slash::Setting { key, value } => {
@@ -2165,6 +2717,38 @@ fn submit(
                     }
                 }
             }
+            Slash::History(n) => {
+                let want = n.unwrap_or(15).clamp(1, 100);
+                if let Ok(conn) = aicli_core::db::open(&ctx.paths.db_file) {
+                    if let Ok(turns) = aicli_core::sessions::list_turns(&conn, &session.id) {
+                        if turns.is_empty() {
+                            messages.push(Msg::full(Role::Sys, "no exchanges yet in this chat"));
+                        } else {
+                            let start = turns.len().saturating_sub(want);
+                            let body: String = turns
+                                .iter()
+                                .skip(start)
+                                .map(|t| {
+                                    let who = if t.role == "user" { "YOU" } else { "ZAI" };
+                                    let first: String = t
+                                        .content
+                                        .lines()
+                                        .next()
+                                        .unwrap_or("")
+                                        .chars()
+                                        .take(64)
+                                        .collect();
+                                    let (clean, _) = clean_legacy_mock(&first);
+                                    format!("{} {who}: {}", short_hm(&t.created_at), clean)
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            messages
+                                .push(Msg::full(Role::Sys, &format!("recent exchanges:\n{body}")));
+                        }
+                    }
+                }
+            }
             Slash::Export(fmt) => {
                 let f = fmt.unwrap_or_else(|| "md".to_string());
                 if let Ok(conn) = aicli_core::db::open(&ctx.paths.db_file) {
@@ -2220,6 +2804,9 @@ fn submit(
     if pending.is_some() {
         return Ok(true);
     }
+    // The question is stored before the answer exists, so history never
+    // loses it even when the stream is cancelled halfway.
+    persist_user(ctx, &session.id, text);
     messages.push(Msg::full(Role::User, text));
     *pending = Some(Pending::Thinking {
         input: text.to_string(),
@@ -2263,37 +2850,226 @@ fn model_rows(ctx: &Ctx, active: &str) -> Vec<ModelRow> {
     rows
 }
 
+/// Smart help for /insert with no args. Lists nearby *.gguf candidates
+/// from the current dir and ~/models so the user can copy a path.
+fn insert_help() -> String {
+    let mut body = String::from(
+        "usage: /insert <file.gguf> [more...] [--name id] [--ctx n] [--default] [--recursive]\n\
+         Pass a folder to import every .gguf inside it. Alias: /add.",
+    );
+    let mut cands: Vec<std::path::PathBuf> = Vec::new();
+    for dir in aicli_models::default_scan_dirs() {
+        for p in aicli_models::find_gguf_files(&dir, false)
+            .into_iter()
+            .take(4)
+        {
+            if !cands.contains(&p) {
+                cands.push(p);
+            }
+            if cands.len() >= 6 {
+                break;
+            }
+        }
+        if cands.len() >= 6 {
+            break;
+        }
+    }
+    if cands.is_empty() {
+        body.push_str("\nno .gguf found in ./models ~/models, try: /insert ~/models/tiny.gguf");
+    } else {
+        body.push_str("\nfound nearby:");
+        for p in cands {
+            body.push_str(&format!("\n  {}", p.display()));
+        }
+    }
+    body
+}
+
+#[allow(clippy::too_many_arguments)]
 fn start_insert(
     ctx: &Ctx,
-    path: &str,
+    paths: &[String],
     name: Option<String>,
     n_ctx: Option<u32>,
+    set_default: bool,
+    recursive: bool,
     overlay: &mut Overlay,
     insert_rx: &mut Option<mpsc::Receiver<InsertMsg>>,
 ) {
-    let src = std::path::PathBuf::from(shellexpand(path));
+    if paths.len() > 1 && name.is_some() {
+        // Fail fast without a thread so the message shows instantly.
+        return;
+    }
+    let raws: Vec<String> = paths.to_vec();
     let models_dir = ctx.paths.models_dir.clone();
+    let config_file = ctx.paths.config_file.clone();
     let (tx, rx) = mpsc::channel();
     *insert_rx = Some(rx);
+    let label = if raws.len() == 1 {
+        format!("copy {}", raws[0])
+    } else {
+        format!("insert {} paths", raws.len())
+    };
     *overlay = Overlay::Insert {
-        label: format!("copy {}", src.display()),
+        label,
         done: 0,
         total: 1,
         finished: None,
     };
     std::thread::spawn(move || {
-        let res = aicli_models::insert_gguf(&models_dir, &src, name.as_deref(), n_ctx, |d, t| {
-            let _ = tx.send(InsertMsg::Progress(d, t));
-        });
-        let _ = tx.send(InsertMsg::Done(res.map_err(|e| e.to_string())));
+        if raws.len() > 1 && name.is_some() {
+            let _ = tx.send(InsertMsg::DoneMany(
+                vec![],
+                vec!["--name only works with a single file".to_string()],
+                None,
+            ));
+            return;
+        }
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
+        for raw in &raws {
+            let p = aicli_models::resolve_insert_path(raw);
+            if p.is_dir() {
+                let found = aicli_models::find_gguf_files(&p, recursive);
+                if found.is_empty() {
+                    failed.push(format!(
+                        "{}: no .gguf files found, retry with --recursive",
+                        p.display()
+                    ));
+                } else {
+                    files.extend(found);
+                }
+            } else if p.exists() {
+                files.push(p);
+            } else {
+                failed.push(format!("{}: file not found", p.display()));
+            }
+        }
+        let mut inserted: Vec<aicli_models::ModelEntry> = Vec::new();
+        for src in &files {
+            match aicli_models::insert_gguf(&models_dir, src, name.as_deref(), n_ctx, |d, t| {
+                let _ = tx.send(InsertMsg::Progress(d, t));
+            }) {
+                Ok(e) => inserted.push(e),
+                Err(e) => failed.push(format!("{}: {e}", src.display())),
+            }
+        }
+        let mut default_id: Option<String> = None;
+        if !inserted.is_empty() {
+            let cached = aicli_models::list_all(&models_dir)
+                .iter()
+                .filter(|m| aicli_models::local_path(&models_dir, m).exists())
+                .count();
+            if set_default || cached <= 1 {
+                if let Some(last) = inserted.last() {
+                    // Best effort default switch from the worker thread.
+                    if let Ok(mut cfg) = aicli_core::Config::load(&config_file) {
+                        cfg.model.default = last.id.clone();
+                        let _ = cfg.save(&config_file);
+                    }
+                    default_id = Some(last.id.clone());
+                }
+            }
+        }
+        let _ = tx.send(InsertMsg::DoneMany(inserted, failed, default_id));
     });
 }
 
-fn shellexpand(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return format!("{home}/{rest}");
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LEGACY_MOCK: &str = "## Answer v1\n\nYou asked: hello\n\nMock stream with temp 0.6.\n\n```rust\n// preview of coding agent output\nfn apply_patch() -> bool {\n    true\n}\n```\n\n- point one\n\nSources:\n- `crates/cli/src/main.rs:1-40` (score 0.81)\n";
+
+    #[test]
+    fn legacy_mock_is_stripped_on_display() {
+        let (clean, was) = clean_legacy_mock(LEGACY_MOCK);
+        assert!(was);
+        assert!(!clean.contains("```"));
+        assert!(!clean.contains("apply_patch"));
+        assert!(!clean.contains("crates/"));
+        assert!(!clean.contains("Sources:"));
+        assert!(clean.contains("You asked: hello"));
     }
-    path.to_string()
+
+    #[test]
+    fn real_user_code_is_preserved() {
+        let real = "help me review:\n```rust\nfn main() {\n    println!(\"hi\");\n}\n```\nend";
+        let (clean, was) = clean_legacy_mock(real);
+        assert!(!was);
+        assert_eq!(clean, real);
+    }
+
+    #[test]
+    fn genuine_sources_tail_is_preserved() {
+        let text = "answer here\n\nSources:\n- docs/guide.md:10-20 score=0.91";
+        let (clean, was) = clean_legacy_mock(text);
+        assert!(!was, "real citations must survive: {clean}");
+    }
+
+    #[test]
+    fn short_hm_slices_rfc3339() {
+        assert_eq!(short_hm("2026-10-06T10:10:18Z"), "10:10");
+        assert_eq!(short_hm("x"), "--:--");
+    }
+
+    #[test]
+    fn logo_lines_are_centered() {
+        let lines = logo_lines(60);
+        assert_eq!(lines.len(), WELCOME_ART.len() + 3);
+        for l in &lines {
+            let width: usize = l.spans.iter().map(|s| s.content.chars().count()).sum();
+            assert!(width <= 60, "logo line overflows: {width}");
+        }
+        // Art block is wider than the title, so its padding is smaller.
+        let art_pad = lines[0].spans[0].content.len();
+        let title_pad = lines[WELCOME_ART.len() + 1].spans[0].content.len();
+        assert!(art_pad < title_pad);
+    }
+
+    #[test]
+    fn flat_and_partial_text_roundtrip() {
+        let m = Msg::full(Role::Zai, "hello\nworld");
+        assert_eq!(flat_text(&m), "hello\nworld");
+        let mut s = Msg::streaming(Role::Zai, "hello\nworld");
+        s.shown = 5;
+        assert_eq!(partial_text(&s), "hello");
+        assert_eq!(partial_text(&Msg::streaming(Role::Zai, "abc")), "");
+    }
+
+    #[test]
+    fn dark_theme_is_actually_dark() {
+        for c in [DARK_BG, DARK_PANEL] {
+            if let Color::Rgb(r, g, b) = c {
+                assert!(r < 40 && g < 40 && b < 40, "theme bg must stay dark");
+            } else {
+                panic!("theme bg must be explicit rgb, never terminal default");
+            }
+        }
+        assert_ne!(DARK_BG, DARK_PANEL);
+    }
+
+    #[test]
+    fn quick_card_has_actions_and_ready_model() {
+        let lines = quick_card_lines("tiny-q4-k-m", 2048);
+        assert_eq!(lines.len(), 5);
+        let flat: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(flat.contains("/model"));
+        assert!(flat.contains("/insert"));
+        assert!(flat.contains("tiny-q4-k-m"));
+        assert!(flat.contains("2048"));
+    }
+
+    #[test]
+    fn truncate_model_keeps_filename_visible() {
+        assert_eq!(truncate_model("tiny", 32), "tiny");
+        let long = "qwen2.5-coder-3b-instruct-q6_k-very-long-name";
+        let short = truncate_model(long, 20);
+        assert!(short.starts_with("..."));
+        assert!(short.ends_with("long-name"));
+    }
 }

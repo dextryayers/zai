@@ -40,6 +40,8 @@ impl SamplerConfig {
 
 /// Deterministic mock answer. Same input plus same sampler gives byte identical output.
 /// Used for repro test and for offline demo before real llama backend.
+/// Never emits code blocks or source citations: those only come from real
+/// retrieval and real model output, so chat history stays clean.
 pub fn mock_answer_with_sampler(query: &str, sampler: &SamplerConfig) -> String {
     let short = truncate_query(query, 500);
     if query.trim().is_empty() {
@@ -47,14 +49,12 @@ pub fn mock_answer_with_sampler(query: &str, sampler: &SamplerConfig) -> String 
     }
     if sampler.temp == 0.0 {
         return format!(
-            "## Answer (seed {})\n\nYou asked: `{short}`\n\nDeterministic output for repro.\n\n```rust\nfn apply_patch() -> bool {{ true }}\n```\n",
+            "## Answer (seed {})\n\nYou asked: {short}\n\nDeterministic mock output for repro. Load a GGUF model or start Ollama for real inference.\n",
             sampler.seed
         );
     }
-    // Non deterministic path varies only by seed in wording order, still stable per seed.
-    let variant = (sampler.seed % 3) + 1;
     format!(
-        "## Answer v{variant}\n\nYou asked: `{short}`\n\nMock stream with temp {:.1}. Real GGUF inference lands behind `llama` feature.\n\n```rust\n// preview of coding agent output\nfn apply_patch() -> bool {{\n    true\n}}\n```\n\n- point one with `inline code`\n- point two with **bold**\n\nSources:\n- `crates/cli/src/main.rs:1-40` (score 0.81)\n",
+        "## Answer\n\nYou asked: {short}\n\nMock answer (temp {:.1}). Real inference needs a GGUF model in cache or a running Ollama daemon. Try /model to switch, /insert to add a GGUF file, or ask math and code review questions answered by the local brain.\n",
         sampler.temp
     )
 }
@@ -104,5 +104,20 @@ mod tests {
         let a = mock_answer_with_sampler("fix test", &s);
         let b = mock_answer_with_sampler("fix test", &s);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn mock_never_leaks_code_or_fake_sources() {
+        for sampler in [
+            SamplerConfig::deterministic(),
+            SamplerConfig::chat(None, 7),
+            SamplerConfig::code(None, 11),
+        ] {
+            let a = mock_answer_with_sampler("where is the pool built", &sampler);
+            assert!(!a.contains("```"), "mock must not emit code fences");
+            assert!(!a.contains("crates/"), "mock must not cite repo paths");
+            assert!(!a.contains("Sources:"), "mock must not fake citations");
+            assert!(!a.contains("fn "), "mock must not emit code");
+        }
     }
 }

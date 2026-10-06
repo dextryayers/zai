@@ -42,6 +42,7 @@ dependencies = [
 name = "aicli-infer"
 version = "0.2.0"
 dependencies = [
+ "aicli-models",
  "anyhow",
  "chrono",
  "serde",
@@ -75,6 +76,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "toml",
+ "walkdir",
 ]
 
 [[package]]
@@ -2955,6 +2957,7 @@ dependencies = [
  "aicli-tools",
  "aicli-ui",
  "anyhow",
+ "chrono",
  "clap",
  "crossterm",
  "ratatui",

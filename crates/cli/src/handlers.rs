@@ -71,6 +71,13 @@ pub async fn dispatch(ctx: Ctx) -> anyhow::Result<()> {
             status,
         }) => cmd_index(&ctx, path, *rebuild, *eval, *status),
         Some(Cmd::Models { op }) => cmd_models(&ctx, op),
+        Some(Cmd::Insert {
+            paths,
+            name,
+            ctx: n_ctx,
+            default,
+            recursive,
+        }) => cmd_models_insert(&ctx, paths, name.clone(), *n_ctx, *default, *recursive),
         Some(Cmd::Ollama { op }) => cmd_ollama(&ctx, op),
         Some(Cmd::Daily {
             today,
@@ -1276,6 +1283,187 @@ fn cmd_index(
     Ok(())
 }
 
+/// Insert one or more GGUF files, or scan folders for *.gguf.
+/// Shared by `zai models insert|add|import` and the `zai insert` shortcut.
+/// Single file keeps the classic single-entry JSON shape. Multi insert
+/// prints an object with inserted plus failed lists.
+fn cmd_models_insert(
+    ctx: &Ctx,
+    paths: &[std::path::PathBuf],
+    name: Option<String>,
+    n_ctx: Option<u32>,
+    set_default: bool,
+    recursive: bool,
+) -> anyhow::Result<()> {
+    let theme = &ctx.theme;
+    if paths.len() > 1 && name.is_some() {
+        anyhow::bail!("--name only works with a single file, drop it for multi insert");
+    }
+    // Expand args into a flat file list. Folders are scanned for *.gguf.
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    for raw in paths {
+        let p = aicli_models::resolve_insert_path(&raw.to_string_lossy());
+        if p.is_dir() {
+            let found = aicli_models::find_gguf_files(&p, recursive);
+            if found.is_empty() {
+                failures.push(format!(
+                    "{}: no .gguf files found, retry with --recursive or pass a file",
+                    p.display()
+                ));
+            } else {
+                files.extend(found);
+            }
+        } else if p.exists() {
+            files.push(p);
+        } else {
+            failures.push(format!(
+                "{}: file not found, check the path or pass a folder",
+                p.display()
+            ));
+        }
+    }
+    if files.is_empty() {
+        if ctx.is_json() {
+            output::print_json(
+                true,
+                serde_json::json!({"inserted": [], "failed": failures}),
+            );
+            return Ok(());
+        }
+        for f in &failures {
+            println!("{}", theme.danger(&format!("insert failed: {f}")));
+        }
+        println!(
+            "{}",
+            theme.muted(
+                "usage: zai insert <file.gguf> [more...] | zai insert <folder> [--recursive]"
+            )
+        );
+        anyhow::bail!("nothing to insert");
+    }
+    // Insert each file. Failures are collected so one bad file never
+    // blocks the rest of the batch.
+    let mut inserted: Vec<aicli_models::ModelEntry> = Vec::new();
+    for src in &files {
+        if !ctx.is_json() {
+            println!("{}", theme.bold(&format!("insert {}", src.display())));
+        }
+        match aicli_models::insert_gguf(
+            &ctx.paths.models_dir,
+            src,
+            name.as_deref(),
+            n_ctx,
+            |done, total| {
+                if ctx.is_json() {
+                    return;
+                }
+                let done_mb = done as f64 / (1024.0 * 1024.0);
+                let total_mb = total as f64 / (1024.0 * 1024.0);
+                print!(
+                    "\r{}",
+                    aicli_ui::progress::download_line("insert", done_mb, total_mb, 0.0)
+                );
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+            },
+        ) {
+            Ok(entry) => {
+                if !ctx.is_json() {
+                    println!();
+                }
+                inserted.push(entry);
+            }
+            Err(e) => {
+                if !ctx.is_json() {
+                    println!();
+                }
+                failures.push(format!("{}: {e}", src.display()));
+            }
+        }
+    }
+    // Auto default: explicit --default wins, else the first ever cached
+    // model becomes default so a fresh install just works.
+    let mut default_id: Option<String> = None;
+    if !inserted.is_empty() {
+        let cached_count = aicli_models::list_all(&ctx.paths.models_dir)
+            .iter()
+            .filter(|m| aicli_models::local_path(&ctx.paths.models_dir, m).exists())
+            .count();
+        if set_default || cached_count <= 1 {
+            if let Some(last) = inserted.last() {
+                let mut cfg = ctx.config.clone();
+                cfg.model.default = last.id.clone();
+                cfg.save(&ctx.paths.config_file)?;
+                default_id = Some(last.id.clone());
+            }
+        }
+    }
+    if ctx.is_json() {
+        if inserted.len() == 1 && failures.is_empty() {
+            output::print_json(true, &inserted[0]);
+        } else {
+            output::print_json(
+                true,
+                serde_json::json!({"inserted": inserted, "failed": failures}),
+            );
+        }
+        if failures.len() > inserted.len() && inserted.is_empty() {
+            std::process::exit(6);
+        }
+        return Ok(());
+    }
+    if !inserted.is_empty() {
+        let rows: Vec<Vec<String>> = inserted
+            .iter()
+            .map(|m| {
+                let status = if default_id.as_deref() == Some(m.id.as_str()) {
+                    "saved, now default".to_string()
+                } else {
+                    "saved".to_string()
+                };
+                vec![
+                    m.id.clone(),
+                    m.quant.clone(),
+                    format!("{} MB", m.size_mb),
+                    format!("{}", m.n_ctx),
+                    status,
+                ]
+            })
+            .collect();
+        println!(
+            "{}",
+            table::render_table(
+                theme,
+                &["ID", "QUANT", "SIZE", "CTX", "STATUS"],
+                &rows,
+                &[false, false, true, true, false]
+            )
+        );
+        for m in &inserted {
+            let note = if default_id.as_deref() == Some(m.id.as_str()) {
+                " (now default)"
+            } else {
+                ""
+            };
+            println!(
+                "{}",
+                theme.ok(&format!(
+                    "saved {} ({} MB, ctx {}){note} - switch with: zai models set-default {}",
+                    m.id, m.size_mb, m.n_ctx, m.id
+                ))
+            );
+        }
+    }
+    for f in &failures {
+        println!("{}", theme.danger(&format!("skipped: {f}")));
+    }
+    if inserted.is_empty() {
+        anyhow::bail!("nothing inserted");
+    }
+    Ok(())
+}
+
 fn cmd_models(ctx: &Ctx, op: &ModelsOp) -> anyhow::Result<()> {
     let theme = &ctx.theme;
     match op {
@@ -1422,49 +1610,12 @@ fn cmd_models(ctx: &Ctx, op: &ModelsOp) -> anyhow::Result<()> {
             Ok(())
         }
         ModelsOp::Insert {
-            path,
+            paths,
             name,
             ctx: n_ctx,
-        } => {
-            let src = if path.is_absolute() {
-                path.clone()
-            } else {
-                std::env::current_dir().unwrap_or_default().join(path)
-            };
-            println!("{}", theme.bold(&format!("insert {}", src.display())));
-            let entry = aicli_models::insert_gguf(
-                &ctx.paths.models_dir,
-                &src,
-                name.as_deref(),
-                *n_ctx,
-                |done, total| {
-                    if ctx.is_json() {
-                        return;
-                    }
-                    let done_mb = done as f64 / (1024.0 * 1024.0);
-                    let total_mb = total as f64 / (1024.0 * 1024.0);
-                    print!(
-                        "\r{}",
-                        aicli_ui::progress::download_line("insert", done_mb, total_mb, 0.0)
-                    );
-                    use std::io::Write;
-                    let _ = std::io::stdout().flush();
-                },
-            )?;
-            println!();
-            if ctx.is_json() {
-                output::print_json(true, &entry);
-            } else {
-                println!(
-                    "{}",
-                    theme.ok(&format!(
-                        "saved {} ({} MB, ctx {}) - switch with: zai models set-default {}",
-                        entry.id, entry.size_mb, entry.n_ctx, entry.id
-                    ))
-                );
-            }
-            Ok(())
-        }
+            default,
+            recursive,
+        } => cmd_models_insert(ctx, paths, name.clone(), *n_ctx, *default, *recursive),
         ModelsOp::Verify { id } => {
             let entry = aicli_models::find_any(&ctx.paths.models_dir, id)
                 .ok_or_else(|| anyhow::anyhow!("unknown model {id}"))?;
@@ -1538,6 +1689,174 @@ fn cmd_models(ctx: &Ctx, op: &ModelsOp) -> anyhow::Result<()> {
             } else {
                 println!("{}", theme.ok(&format!("active model: {id}")));
             }
+            Ok(())
+        }
+        ModelsOp::Scan { paths, recursive } => {
+            // Default folders when the user passes none.
+            let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+            for raw in paths {
+                dirs.push(aicli_models::resolve_insert_path(&raw.to_string_lossy()));
+            }
+            if dirs.is_empty() {
+                dirs = aicli_models::default_scan_dirs();
+            }
+            if dirs.is_empty() {
+                if ctx.is_json() {
+                    output::print_json(true, serde_json::json!([]));
+                    return Ok(());
+                }
+                println!(
+                    "{}",
+                    theme.muted("no model folders found, try: zai models scan ~/models")
+                );
+                return Ok(());
+            }
+            let mut files: Vec<std::path::PathBuf> = Vec::new();
+            for d in &dirs {
+                if d.is_dir() {
+                    files.extend(aicli_models::find_gguf_files(d, *recursive));
+                } else if d.is_file() {
+                    files.push(d.clone());
+                }
+            }
+            files.sort();
+            files.dedup();
+            #[derive(Serialize, Clone)]
+            struct Row {
+                path: String,
+                arch: String,
+                quant: String,
+                size_mb: u64,
+                ctx_hint: u32,
+                status: String,
+            }
+            let mut rows_data: Vec<Row> = Vec::new();
+            for f in &files {
+                match aicli_models::inspect_gguf(f) {
+                    Ok(info) => {
+                        let saved_name = f
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        let saved = aicli_models::list_all(&ctx.paths.models_dir)
+                            .iter()
+                            .find(|m| {
+                                let p = aicli_models::local_path(&ctx.paths.models_dir, m);
+                                p.exists()
+                                    && p.file_name().and_then(|s| s.to_str())
+                                        == Some(saved_name.as_str())
+                            })
+                            .map(|m| format!("saved as {}", m.id));
+                        rows_data.push(Row {
+                            path: f.display().to_string(),
+                            arch: info.architecture.clone().unwrap_or_else(|| "-".to_string()),
+                            quant: info.quant.clone(),
+                            size_mb: info.size_mb,
+                            ctx_hint: info.suggested_ctx,
+                            status: saved.unwrap_or_else(|| "not saved".to_string()),
+                        });
+                    }
+                    Err(e) => rows_data.push(Row {
+                        path: f.display().to_string(),
+                        arch: "-".to_string(),
+                        quant: "-".to_string(),
+                        size_mb: 0,
+                        ctx_hint: 0,
+                        status: format!("unreadable: {e}"),
+                    }),
+                }
+            }
+            if ctx.is_json() {
+                output::print_json(true, &rows_data);
+                return Ok(());
+            }
+            if rows_data.is_empty() {
+                println!(
+                    "{}",
+                    theme.muted("no .gguf files found, retry with --recursive")
+                );
+                return Ok(());
+            }
+            let rows: Vec<Vec<String>> = rows_data
+                .iter()
+                .map(|r| {
+                    vec![
+                        r.path.clone(),
+                        r.arch.clone(),
+                        r.quant.clone(),
+                        format!("{} MB", r.size_mb),
+                        format!("{}", r.ctx_hint),
+                        r.status.clone(),
+                    ]
+                })
+                .collect();
+            println!(
+                "{}",
+                table::render_table(
+                    theme,
+                    &["PATH", "ARCH", "QUANT", "SIZE", "CTX", "STATUS"],
+                    &rows,
+                    &[false, false, false, true, true, false]
+                )
+            );
+            println!(
+                "{}",
+                theme.muted("import with: zai insert <path> [--recursive] [--default]")
+            );
+            Ok(())
+        }
+        ModelsOp::Inspect { path } => {
+            let p = aicli_models::resolve_insert_path(&path.to_string_lossy());
+            let info = match aicli_models::inspect_gguf(&p) {
+                Ok(info) => info,
+                Err(e) => {
+                    if ctx.is_json() {
+                        output::print_json_error(
+                            "E_MODEL_MISSING",
+                            &e.to_string(),
+                            "check the path",
+                        );
+                    } else {
+                        println!("{}", theme.danger(&format!("inspect failed: {e}")));
+                    }
+                    anyhow::bail!("{e}");
+                }
+            };
+            if ctx.is_json() {
+                output::print_json(true, &info);
+                return Ok(());
+            }
+            let rows = vec![
+                vec!["path".to_string(), info.path.clone()],
+                vec!["version".to_string(), format!("GGUF v{}", info.version)],
+                vec!["tensors".to_string(), format!("{}", info.tensors)],
+                vec!["metadata".to_string(), format!("{} kv", info.metadata_kv)],
+                vec!["alignment".to_string(), format!("{}", info.alignment)],
+                vec![
+                    "arch".to_string(),
+                    info.architecture.clone().unwrap_or_else(|| "-".to_string()),
+                ],
+                vec!["quant".to_string(), info.quant.clone()],
+                vec!["size".to_string(), format!("{} MB", info.size_mb)],
+                vec!["suggested id".to_string(), info.suggested_id.clone()],
+                vec![
+                    "suggested ctx".to_string(),
+                    format!("{}", info.suggested_ctx),
+                ],
+            ];
+            println!(
+                "{}",
+                table::render_table(theme, &["KEY", "VALUE"], &rows, &[false, false])
+            );
+            println!(
+                "{}",
+                theme.muted(&format!(
+                    "import with: zai insert {} --ctx {}",
+                    p.display(),
+                    info.suggested_ctx
+                ))
+            );
             Ok(())
         }
     }

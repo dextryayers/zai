@@ -16,6 +16,7 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
+chrono = { workspace = true }
 rustyline = { workspace = true }
 rusqlite = { workspace = true }
 ratatui = { workspace = true }

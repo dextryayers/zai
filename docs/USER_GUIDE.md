@@ -13,7 +13,7 @@ every action is a `/` command with Tab completion popup.
 /manage                       manage page: Ollama tab plus GGUF tab
 /ollama <list|pull|rm|show>   Ollama daemon models
 /run <cmd>                    shell under the shell mode gate
-/insert <file.gguf> [--name id] [--ctx n]   save a GGUF, unlimited models
+/insert <file.gguf> [more...] [--name id] [--ctx n] [--default]   save GGUFs, folders work too, alias /add
 /setting [set <key> <value>]  settings page
 /effort [level]               Default Low Medium High XHigh Expert
 /budget, /compact, /export    context tools
@@ -119,9 +119,10 @@ Week shows counts only, no invented narrative. Memory is user owned, model reads
 
 ```bash
 zai models list
-zai models insert ~/models/tiny-q4_k_m.gguf --name tiny --ctx 2048
-zai models set-default tiny
-zai models verify tiny
+zai insert ~/models/tiny-q4_k_m.gguf
+zai insert ~/models --recursive
+zai models set-default tiny-q4-k-m
+zai models verify tiny-q4-k-m
 zai models pull qwen2.5-3b-instruct-q4_k_m
 zai ollama status
 zai ollama list
@@ -130,6 +131,23 @@ zai ollama rm llama3.1
 zai doctor
 zai doctor --bench-load --bench-gen 64
 ```
+
+Shortest path: `zai insert <file>` guesses the name, quant, and ctx,
+and the first model becomes default automatically. `models add` and
+`models import` are aliases for `models insert`. In chat use
+`/insert <file> [more...]` or `/add`, bare `/insert` lists nearby files.
+
+```bash
+zai models scan
+zai models scan ~/models --recursive
+zai models inspect ~/models/tiny-q4_k_m.gguf
+```
+
+`scan` finds GGUF files across folders (defaults: `./models`, `.`,
+`~/models`, `~/Models`, plus `ZAI_MODELS_DIRS`) and shows arch, quant,
+size, ctx hint, and saved status. `inspect` reads one file deep: GGUF
+version, tensor count, metadata entries, architecture, quant, and the
+id plus ctx an insert would use.
 
 GGUF files are local only: insert from disk, delete from cache, never download.
 Ollama models install and delete through the daemon.

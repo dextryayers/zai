@@ -127,9 +127,10 @@ fn sanitize_id(raw: &str) -> Result<String> {
 }
 
 fn guess_quant(name: &str) -> String {
-    let upper = name.to_ascii_uppercase();
+    let upper = name.to_ascii_uppercase().replace(['-', ' '], "_");
     for q in [
-        "Q8_0", "Q6_K", "Q5_K_M", "Q5_K_S", "Q4_K_M", "Q4_K_S", "Q4_0", "Q3_K_M", "Q2_K",
+        "Q8_0", "Q6_K", "Q5_K_M", "Q5_K_S", "Q5_0", "Q5_1", "Q4_K_M", "Q4_K_S", "Q4_K", "Q4_0",
+        "Q4_1", "Q3_K_M", "Q3_K_S", "Q2_K", "IQ4_XS", "IQ3_M", "BF16", "F16", "F32",
     ] {
         if upper.contains(q) {
             return q.to_string();
@@ -138,25 +139,296 @@ fn guess_quant(name: &str) -> String {
     "unknown".to_string()
 }
 
-/// Validate GGUF header: magic plus version range. Returns version and tensor count.
-pub fn check_gguf_header(path: &Path) -> Result<(u32, u64)> {
+/// Rich GGUF file description used by inspect, scan, insert preview,
+/// and the inference loader. Parsed from the file header plus a bounded
+/// walk of the metadata KV section, so huge model files stay fast.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GgufInfo {
+    pub path: String,
+    pub version: u32,
+    pub tensors: u64,
+    pub metadata_kv: u64,
+    pub alignment: u32,
+    pub size_bytes: u64,
+    pub size_mb: u64,
+    pub architecture: Option<String>,
+    pub quant: String,
+    pub suggested_id: String,
+    pub suggested_ctx: u32,
+}
+
+/// Default folders scanned for GGUF files when no path is given:
+/// current dir, ./models, ~/models, ~/Models, plus ZAI_MODELS_DIRS entries.
+/// Only existing directories are returned, sorted, deduped.
+pub fn default_scan_dirs() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut push = |p: PathBuf| {
+        if p.is_dir() && !out.contains(&p) {
+            out.push(p);
+        }
+    };
+    if let Ok(cwd) = std::env::current_dir() {
+        push(cwd.join("models"));
+        push(cwd);
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        push(PathBuf::from(format!("{home}/models")));
+        push(PathBuf::from(format!("{home}/Models")));
+    }
+    if let Ok(extra) = std::env::var("ZAI_MODELS_DIRS") {
+        for part in extra.split(':').map(str::trim).filter(|s| !s.is_empty()) {
+            push(PathBuf::from(part));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Read and validate a GGUF file, returning rich header metadata.
+/// Reads at most 1 MB from the front of the file, so multi GB models
+/// inspect in milliseconds. The KV walk stops at the first unreadable
+/// entry and still returns the validated header fields.
+pub fn inspect_gguf(path: &Path) -> Result<GgufInfo> {
     use std::io::Read;
-    let mut f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut hdr = [0u8; 16];
-    f.read_exact(&mut hdr)
-        .with_context(|| format!("{} too small to be GGUF", path.display()))?;
-    anyhow::ensure!(
-        &hdr[0..4] == b"GGUF",
-        "{} has bad GGUF magic",
-        path.display()
-    );
-    let version = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+    anyhow::ensure!(path.exists(), "file not found: {}", path.display());
+    let size_bytes = std::fs::metadata(path)?.len();
+    let mut f = std::fs::File::open(path)?;
+    let cap = size_bytes.min(1024 * 1024) as usize;
+    let mut buf = vec![0u8; cap.max(32)];
+    f.read_exact(&mut buf)?;
+    let mut cur = &buf[..];
+    let mut take = |n: usize| -> Result<&[u8]> {
+        if cur.len() < n {
+            anyhow::bail!("{} header truncated", path.display());
+        }
+        let (head, rest) = cur.split_at(n);
+        cur = rest;
+        Ok(head)
+    };
+    anyhow::ensure!(take(4)? == b"GGUF", "{} has bad GGUF magic", path.display());
+    let version = u32::from_le_bytes(take(4)?.try_into().unwrap());
     anyhow::ensure!(
         (1..=10).contains(&version),
         "unsupported GGUF version {version}"
     );
-    let tensors = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
-    Ok((version, tensors))
+    let tensors = u64::from_le_bytes(take(8)?.try_into().unwrap());
+    let metadata_kv = u64::from_le_bytes(take(8)?.try_into().unwrap());
+    // v1 has no alignment field. Default is 32 per GGUF spec.
+    let alignment = if version >= 2 {
+        u32::from_le_bytes(take(4)?.try_into().unwrap()).max(1)
+    } else {
+        32
+    };
+    let architecture = walk_gguf_architecture(&mut cur, metadata_kv.min(256));
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("model.gguf")
+        .to_string();
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("model");
+    let suggested_id = sanitize_id(stem).unwrap_or_else(|_| "model".to_string());
+    Ok(GgufInfo {
+        path: path.display().to_string(),
+        version,
+        tensors,
+        metadata_kv,
+        alignment,
+        size_bytes,
+        size_mb: (size_bytes / (1024 * 1024)).max(1),
+        architecture,
+        quant: guess_quant(&file_name),
+        suggested_id,
+        suggested_ctx: suggest_ctx(size_bytes),
+    })
+}
+
+/// Walk at most `limit` metadata KV entries looking for general.architecture.
+/// Only string values are decoded. Any malformed entry ends the walk with
+/// whatever was found so far, never an error.
+fn walk_gguf_architecture(cur: &mut &[u8], limit: u64) -> Option<String> {
+    fn take<'a>(cur: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+        if cur.len() < n {
+            return None;
+        }
+        let (head, rest) = cur.split_at(n);
+        *cur = rest;
+        Some(head)
+    }
+    fn take_u32(cur: &mut &[u8]) -> Option<u32> {
+        take(cur, 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+    }
+    fn take_u64(cur: &mut &[u8]) -> Option<u64> {
+        take(cur, 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+    }
+    fn take_str(cur: &mut &[u8]) -> Option<String> {
+        let len = take_u64(cur)? as usize;
+        if len > 1024 || cur.len() < len {
+            return None;
+        }
+        let bytes = take(cur, len)?;
+        String::from_utf8(bytes.to_vec()).ok()
+    }
+    // Byte size of one fixed width element. None for dynamic types.
+    fn fixed_size(ty: u32) -> Option<u64> {
+        match ty {
+            0 | 1 | 7 => Some(1),
+            2 | 3 => Some(2),
+            4..=6 => Some(4),
+            10..=12 => Some(8),
+            _ => None,
+        }
+    }
+    fn skip_value(cur: &mut &[u8], ty: u32) -> bool {
+        if let Some(sz) = fixed_size(ty) {
+            return take(cur, sz as usize).is_some();
+        }
+        match ty {
+            8 => take_str(cur).is_some(),
+            9 => {
+                let elem = take_u32(cur);
+                let len = take_u64(cur);
+                let (elem, len) = match (elem, len) {
+                    (Some(e), Some(l)) => (e, l),
+                    _ => return false,
+                };
+                if len > 4096 {
+                    return false;
+                }
+                if let Some(sz) = fixed_size(elem) {
+                    let total = len.saturating_mul(sz) as usize;
+                    if total > 1024 * 1024 {
+                        return false;
+                    }
+                    take(cur, total).is_some()
+                } else if elem == 8 {
+                    (0..len).all(|_| take_str(cur).is_some())
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+    for _ in 0..limit {
+        let key = match take_str(cur) {
+            Some(k) => k,
+            None => break,
+        };
+        let ty = match take_u32(cur) {
+            Some(t) => t,
+            None => break,
+        };
+        if key == "general.architecture" && ty == 8 {
+            return take_str(cur);
+        }
+        if !skip_value(cur, ty) {
+            break;
+        }
+    }
+    None
+}
+
+/// Suggest a context size from file size, snapped to allowed n_ctx values.
+/// Small files default to 2048, mid files to 4096, large files to 8192.
+pub fn suggest_ctx(size_bytes: u64) -> u32 {
+    const MB: u64 = 1024 * 1024;
+    let mb = size_bytes / MB;
+    if mb <= 1100 {
+        2048
+    } else if mb <= 2600 {
+        4096
+    } else {
+        8192
+    }
+}
+
+/// Expand `~` and resolve relative paths against the current dir.
+/// Accepts quoted paths by trimming one layer of single or double quotes.
+pub fn resolve_insert_path(raw: &str) -> PathBuf {
+    let mut s = raw.trim().to_string();
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
+    {
+        s = s[1..s.len() - 1].to_string();
+    }
+    let expanded = if let Some(rest) = s.strip_prefix("~/") {
+        std::env::var("HOME")
+            .map(|h| format!("{h}/{rest}"))
+            .unwrap_or(s)
+    } else {
+        s
+    };
+    let p = PathBuf::from(&expanded);
+    if p.is_absolute() {
+        p
+    } else {
+        std::env::current_dir().unwrap_or_default().join(p)
+    }
+}
+
+/// Scan a directory for `.gguf` files, sorted by path. Recursive when asked.
+pub fn find_gguf_files(dir: &Path, recursive: bool) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if recursive {
+        for entry in walkdir::WalkDir::new(dir)
+            .follow_links(false)
+            .into_iter()
+            .flatten()
+        {
+            let p = entry.path().to_path_buf();
+            if p.is_file()
+                && p.extension()
+                    .map(|e| e.eq_ignore_ascii_case("gguf"))
+                    .unwrap_or(false)
+            {
+                out.push(p);
+            }
+        }
+    } else if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_file()
+                && p.extension()
+                    .map(|e| e.eq_ignore_ascii_case("gguf"))
+                    .unwrap_or(false)
+            {
+                out.push(p);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Preview what an insert would register, without copying anything.
+/// Returns the id, quant, size, and effective ctx the real insert would use.
+pub fn preview_insert(src: &Path, name: Option<&str>, n_ctx: Option<u32>) -> Result<ModelEntry> {
+    let info = inspect_gguf(src)?;
+    let id = sanitize_id(name.unwrap_or(&info.suggested_id))?;
+    Ok(ModelEntry {
+        id: id.clone(),
+        repo: "local".to_string(),
+        file: src
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("model.gguf")
+            .to_string(),
+        quant: if name.is_some() {
+            guess_quant(&id)
+        } else {
+            info.quant.clone()
+        },
+        size_mb: info.size_mb,
+        n_ctx: n_ctx.unwrap_or(info.suggested_ctx),
+        is_default: false,
+        sha256: None,
+    })
+}
+
+/// Validate GGUF header: magic plus version range. Returns version and tensor count.
+pub fn check_gguf_header(path: &Path) -> Result<(u32, u64)> {
+    let info = inspect_gguf(path)?;
+    Ok((info.version, info.tensors))
 }
 
 /// Insert a local GGUF file into the models cache and registry.
@@ -225,7 +497,7 @@ pub fn insert_gguf(
         file: file_name,
         quant: guess_quant(&id),
         size_mb: (std::fs::metadata(&dest)?.len() / (1024 * 1024)).max(1),
-        n_ctx: n_ctx.unwrap_or(4096),
+        n_ctx: n_ctx.unwrap_or_else(|| suggest_ctx(total)),
         is_default: false,
         sha256: Some(sha),
     };
@@ -441,6 +713,73 @@ mod tests {
         .unwrap());
     }
 
+    fn fake_gguf_v3_arch(dir: &std::path::Path, name: &str, arch: &str) -> std::path::PathBuf {
+        let p = dir.join(name);
+        let mut b = b"GGUF".to_vec();
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&7u64.to_le_bytes());
+        b.extend_from_slice(&2u64.to_le_bytes());
+        b.extend_from_slice(&32u32.to_le_bytes());
+        // kv 1: general.architecture = arch (string)
+        let key = b"general.architecture";
+        b.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        b.extend_from_slice(key);
+        b.extend_from_slice(&8u32.to_le_bytes());
+        b.extend_from_slice(&(arch.len() as u64).to_le_bytes());
+        b.extend_from_slice(arch.as_bytes());
+        // kv 2: general.quantization_version = 2 (u32)
+        let key2 = b"general.quantization_version";
+        b.extend_from_slice(&(key2.len() as u64).to_le_bytes());
+        b.extend_from_slice(key2);
+        b.extend_from_slice(&4u32.to_le_bytes());
+        b.extend_from_slice(&2u32.to_le_bytes());
+        b.extend(vec![0u8; 64]);
+        std::fs::write(&p, &b).unwrap();
+        p
+    }
+
+    #[test]
+    fn inspect_reads_versions_tensors_and_arch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let v1 = fake_gguf(tmp.path(), "tiny-q4_k_m.gguf");
+        let info = inspect_gguf(&v1).unwrap();
+        assert_eq!(info.version, 3);
+        assert_eq!(info.tensors, 5);
+        assert_eq!(info.quant, "Q4_K_M");
+        assert_eq!(info.suggested_id, "tiny-q4-k-m");
+        assert_eq!(info.suggested_ctx, 2048);
+        assert_eq!(info.architecture, None);
+        let v3 = fake_gguf_v3_arch(tmp.path(), "llama-q8_0.gguf", "llama");
+        let info3 = inspect_gguf(&v3).unwrap();
+        assert_eq!(info3.version, 3);
+        assert_eq!(info3.tensors, 7);
+        assert_eq!(info3.metadata_kv, 2);
+        assert_eq!(info3.alignment, 32);
+        assert_eq!(info3.architecture, Some("llama".to_string()));
+        assert_eq!(info3.quant, "Q8_0");
+        let bad = tmp.path().join("bad.gguf");
+        std::fs::write(&bad, b"NOPE-NOPE-NOPE-NOPE-NOPE").unwrap();
+        assert!(inspect_gguf(&bad).is_err());
+        assert!(inspect_gguf(&tmp.path().join("missing.gguf")).is_err());
+        // Extended quant names.
+        assert_eq!(super::guess_quant("m-IQ4_XS.gguf"), "IQ4_XS");
+        assert_eq!(super::guess_quant("m-f16.gguf"), "F16");
+        assert_eq!(super::guess_quant("m-Q4_K.gguf"), "Q4_K");
+    }
+
+    #[test]
+    fn scan_dirs_lists_existing_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = tmp.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        // default_scan_dirs reads real HOME and cwd, so only assert it runs
+        // and returns sorted unique existing dirs.
+        let dirs = default_scan_dirs();
+        let mut sorted = dirs.clone();
+        sorted.sort();
+        assert_eq!(dirs, sorted);
+    }
+
     fn fake_gguf(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
         let p = dir.join(name);
         let mut bytes = b"GGUF".to_vec();
@@ -450,6 +789,31 @@ mod tests {
         bytes.extend(vec![0u8; 64]);
         std::fs::write(&p, &bytes).unwrap();
         p
+    }
+
+    #[test]
+    fn insert_helpers_suggest_scan_and_preview() {
+        assert_eq!(suggest_ctx(100 * 1024 * 1024), 2048);
+        assert_eq!(suggest_ctx(2000 * 1024 * 1024), 4096);
+        assert_eq!(suggest_ctx(5000 * 1024 * 1024), 8192);
+        let tmp = tempfile::tempdir().unwrap();
+        let a = fake_gguf(tmp.path(), "tiny-q4_k_m.gguf");
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let _b = fake_gguf(&sub, "big-q4_k_m.gguf");
+        std::fs::write(tmp.path().join("note.txt"), b"x").unwrap();
+        let top = find_gguf_files(tmp.path(), false);
+        assert_eq!(top, vec![a.clone()]);
+        let all = find_gguf_files(tmp.path(), true);
+        assert_eq!(all.len(), 2);
+        let prev = preview_insert(&a, None, None).unwrap();
+        assert_eq!(prev.id, "tiny-q4-k-m");
+        assert_eq!(prev.quant, "Q4_K_M");
+        assert_eq!(prev.n_ctx, 2048);
+        assert!(preview_insert(&a, Some("My Tiny!"), Some(8192)).unwrap().id == "my-tiny");
+        let p = resolve_insert_path("~/m.gguf");
+        assert!(p.ends_with("m.gguf"));
+        assert!(resolve_insert_path("./a.gguf").is_absolute());
     }
 
     #[test]

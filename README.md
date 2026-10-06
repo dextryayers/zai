@@ -8,19 +8,26 @@ Status: v0.1.0-alpha. Bare `zai` opens the full screen TUI with sessions panel a
 
 ```bash
 ./install.sh
-# fast local install without release optimize:
-./install.sh --debug
+# check freshness without building:
+zai update --check
 # then in a new shell:
 zai doctor
 ```
+
+No options: every `./install.sh` run builds the latest release from
+source and installs it. The installer puts `zai.bin` plus a `zai` wrapper
+on PATH. The wrapper rebuilds when sources under `crates/`, `Cargo.toml`,
+`Cargo.lock`, or `install.sh` are newer than the installed binary, so every
+`zai ...` run stays updated. Skip one check with `ZAI_NO_AUTO_UPDATE=1`,
+debug it with `ZAI_UPDATE_VERBOSE=1`.
 
 ## Quickstart
 
 ```bash
 zai                 # full screen UI: sessions left, chat main, / commands
 zai doctor
-zai models insert ~/models/tiny-q4_k_m.gguf --name tiny
-zai models set-default tiny
+zai insert ~/models/tiny-q4_k_m.gguf
+zai models set-default tiny-q4-k-m
 zai index ./docs --rebuild
 zai ask "where is thread pool built" --index ./docs --show-sources
 zai code "fix failing test" --path ./crates/tools
