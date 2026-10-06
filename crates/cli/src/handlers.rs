@@ -66,7 +66,12 @@ pub async fn dispatch(ctx: Ctx) -> anyhow::Result<()> {
         ),
         Some(Cmd::Patch { op }) => cmd_patch(&ctx, op),
         Some(Cmd::Run { cmd }) => cmd_run(&ctx, cmd),
-        Some(Cmd::Index { path, rebuild }) => cmd_index(&ctx, path, *rebuild),
+        Some(Cmd::Index {
+            path,
+            rebuild,
+            eval,
+            status,
+        }) => cmd_index(&ctx, path, *rebuild, *eval, *status),
         Some(Cmd::Models { op }) => cmd_models(&ctx, op),
         Some(Cmd::Daily {
             today,
@@ -101,7 +106,7 @@ fn show_home(ctx: &Ctx) -> anyhow::Result<()> {
             true,
             Data {
                 product: "aicli".to_string(),
-                version: "0.4.0".to_string(),
+                version: "1.0.0".to_string(),
                 model: ctx.config.model.default.clone(),
                 profile: ctx.paths.profile.clone(),
             },
@@ -112,7 +117,7 @@ fn show_home(ctx: &Ctx) -> anyhow::Result<()> {
         "{}",
         status::status_line(
             theme,
-            "0.4.0",
+            "1.0.0",
             &ctx.config.model.default,
             0,
             ctx.config.model.n_ctx,
@@ -176,9 +181,9 @@ fn sampler_for(
 fn cmd_ask(
     ctx: &Ctx,
     query: &str,
-    _top_k: usize,
+    top_k: usize,
     show_sources: bool,
-    _no_rag: bool,
+    no_rag: bool,
     model_override: Option<String>,
     session_opt: Option<String>,
     temp: Option<f32>,
@@ -206,9 +211,55 @@ fn cmd_ask(
         })
         .unwrap_or_default();
 
-    let chunks = vec!["crates/cli/src/main.rs: command tree and dispatch".to_string()];
+    // Phase 6 real retrieval when index exists. Falls back to mock chunk.
+    let top_k = top_k.clamp(1, 10);
+    let (chunks, retrieved) = if no_rag {
+        (vec![], vec![])
+    } else {
+        // Index root: --index flag or first config path or cwd.
+        let root = ctx
+            .cli
+            .cmd
+            .as_ref()
+            .and_then(|c| match c {
+                Cmd::Ask { index, .. } => index.clone(),
+                _ => None,
+            })
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                ctx.config
+                    .index
+                    .paths
+                    .first()
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+            });
+        let root_abs = root.canonicalize().unwrap_or(root.clone());
+        match aicli_rag::retrieve(&ctx.paths.cache_dir, &root_abs, query, top_k) {
+            Ok(hits) if !hits.is_empty() => {
+                let texts: Vec<String> = hits
+                    .iter()
+                    .map(|h| {
+                        format!(
+                            "[SOURCE] {}:{}-{} score={:.2}\n{}",
+                            h.path,
+                            h.start_line,
+                            h.end_line,
+                            h.score,
+                            h.text.chars().take(800).collect::<String>()
+                        )
+                    })
+                    .collect();
+                (texts, hits)
+            }
+            _ => (
+                vec!["crates/cli/src/main.rs: command tree and dispatch".to_string()],
+                vec![],
+            ),
+        }
+    };
     let usage = aicli_infer::build_prompt(
-        "You are AICLI, a local assistant. Answer concisely.",
+        "You are AICLI, a local assistant. Answer concisely. Use provided sources first and cite paths.",
         &chunks,
         &history,
         query,
@@ -309,6 +360,15 @@ fn cmd_ask(
 
     if ctx.is_json() {
         #[derive(Serialize)]
+        struct Source {
+            path: String,
+            start_line: usize,
+            end_line: usize,
+            score: f64,
+            bm25: f64,
+            vector: f64,
+        }
+        #[derive(Serialize)]
         struct Data {
             query: String,
             answer: String,
@@ -316,7 +376,19 @@ fn cmd_ask(
             sampler: aicli_infer::SamplerConfig,
             usage: aicli_infer::PromptUsage,
             backend: String,
+            sources: Vec<Source>,
         }
+        let sources: Vec<Source> = retrieved
+            .iter()
+            .map(|h| Source {
+                path: h.path.clone(),
+                start_line: h.start_line,
+                end_line: h.end_line,
+                score: (h.score * 100.0).round() / 100.0,
+                bm25: (h.bm25 * 100.0).round() / 100.0,
+                vector: (h.vector * 100.0).round() / 100.0,
+            })
+            .collect();
         output::print_json(
             true,
             Data {
@@ -326,6 +398,7 @@ fn cmd_ask(
                 sampler,
                 usage,
                 backend: backend_note,
+                sources,
             },
         );
         return Ok(());
@@ -337,7 +410,7 @@ fn cmd_ask(
             "{}",
             status::status_line(
                 theme,
-                "0.4.0",
+                "1.0.0",
                 &model_id,
                 usage.estimated_tokens as u32,
                 n_ctx,
@@ -357,14 +430,35 @@ fn cmd_ask(
     println!();
     println!("{}", markdown::render_markdown(theme, &answer));
     if show_sources {
-        println!(
-            "{}",
-            panel::render_panel(
-                theme,
-                "Sources",
-                "[1] crates/cli/src/main.rs:1-40 score=0.81"
-            )
-        );
+        if retrieved.is_empty() {
+            println!(
+                "{}",
+                panel::render_panel(
+                    theme,
+                    "Sources",
+                    "no index hits, run: aicli index ./docs --rebuild"
+                )
+            );
+        } else {
+            let body = retrieved
+                .iter()
+                .enumerate()
+                .map(|(i, h)| {
+                    format!(
+                        "[{}] {}:{}-{} score={:.2} bm25={:.2} vec={:.2}",
+                        i + 1,
+                        h.path,
+                        h.start_line,
+                        h.end_line,
+                        h.score,
+                        h.bm25,
+                        h.vector
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            println!("{}", panel::render_panel(theme, "Sources", &body));
+        }
     }
     Ok(())
 }
@@ -1029,38 +1123,141 @@ fn cmd_run(ctx: &Ctx, cmd: &[String]) -> anyhow::Result<()> {
     }
 }
 
-fn cmd_index(ctx: &Ctx, path: &std::path::Path, rebuild: bool) -> anyhow::Result<()> {
+fn cmd_index(
+    ctx: &Ctx,
+    path: &std::path::Path,
+    rebuild: bool,
+    eval: bool,
+    status_only: bool,
+) -> anyhow::Result<()> {
     let theme = &ctx.theme;
+    let cache_dir = ctx.paths.cache_dir.clone();
+    if eval {
+        // Elegant eval animation with progress dots.
+        if !ctx.is_json() {
+            for i in 0..4 {
+                print!(
+                    "\r{}",
+                    progress::spinner_line(theme, i, "rag eval: 10 queries")
+                );
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
+            println!();
+        }
+        let (passed, total, details) = aicli_rag::eval::run_eval(&cache_dir)?;
+        if ctx.is_json() {
+            #[derive(Serialize)]
+            struct Row {
+                query: String,
+                ok: bool,
+                tops: Vec<String>,
+            }
+            let rows: Vec<Row> = details
+                .into_iter()
+                .map(|(query, ok, tops)| Row { query, ok, tops })
+                .collect();
+            output::print_json(
+                true,
+                serde_json::json!({"passed": passed, "total": total, "cases": rows}),
+            );
+            return Ok(());
+        }
+        let rows: Vec<Vec<String>> = details
+            .iter()
+            .map(|(q, ok, tops)| {
+                vec![
+                    q.clone(),
+                    if *ok {
+                        "pass".to_string()
+                    } else {
+                        "fail".to_string()
+                    },
+                    tops.first().cloned().unwrap_or_default(),
+                ]
+            })
+            .collect();
+        println!(
+            "{}",
+            table::render_table(
+                theme,
+                &["QUERY", "OK", "TOP1"],
+                &rows,
+                &[false, false, false]
+            )
+        );
+        if passed >= 8 {
+            println!("{}", theme.ok(&format!("rag eval {passed}/{total} pass")));
+        } else {
+            println!(
+                "{}",
+                theme.danger(&format!("rag eval {passed}/{total} below gate 8/10"))
+            );
+            std::process::exit(6);
+        }
+        return Ok(());
+    }
+    if status_only {
+        let msg = aicli_rag::index::index_status_report(&cache_dir, path)?;
+        if ctx.is_json() {
+            output::print_json(true, serde_json::json!({"status": msg}));
+        } else {
+            println!("{}", panel::render_panel(theme, "Index status", &msg));
+        }
+        return Ok(());
+    }
     let opts = aicli_ingest::walk::WalkOptions {
         exts: ctx.config.index.ext.clone(),
         exclude_globs: ctx.config.index.exclude.clone(),
         include_hidden: false,
         max_file_mb: ctx.config.index.max_file_mb,
     };
-    print!("{}", progress::spinner_line(theme, 0, "scanning"));
-    let rep = aicli_ingest::walk::collect_files(path, &opts);
-    print!("\r");
+    // Animated build with live counts.
+    let rep = aicli_rag::build_index(
+        path,
+        &cache_dir,
+        &opts,
+        ctx.config.index.chunk_tokens,
+        ctx.config.index.overlap_tokens,
+        &ctx.config.index.ext,
+        rebuild,
+        |done, total, chunks| {
+            if !ctx.cli.json {
+                print!(
+                    "\r{}",
+                    progress::spinner_line(
+                        theme,
+                        done,
+                        &format!("indexing {done}/{total} files | {chunks} chunks")
+                    )
+                );
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+            }
+        },
+    )
+    .map_err(|e| {
+        // Stale index error already contains rebuild fix.
+        anyhow::anyhow!("{e}")
+    })?;
+    println!();
     if ctx.is_json() {
-        #[derive(Serialize)]
-        struct Data {
-            files: usize,
-            skipped_large: usize,
-            rebuild: bool,
-        }
-        output::print_json(
-            true,
-            Data {
-                files: rep.files.len(),
-                skipped_large: rep.skipped_large.len(),
-                rebuild,
-            },
-        );
+        output::print_json(true, &rep);
         return Ok(());
     }
     let rows = vec![vec![
-        path.display().to_string(),
-        rep.files.len().to_string(),
-        rep.skipped_large.len().to_string(),
+        rep.root.clone(),
+        rep.files.to_string(),
+        rep.chunks.to_string(),
+        format!("{}ms", rep.elapsed_ms),
+        format!(
+            "{}+{}-{} skip{}",
+            rep.added,
+            rep.updated,
+            rep.removed,
+            rep.skipped_large + rep.skipped_binary
+        ),
         if rebuild {
             "rebuild".to_string()
         } else {
@@ -1071,20 +1268,22 @@ fn cmd_index(ctx: &Ctx, path: &std::path::Path, rebuild: bool) -> anyhow::Result
         "{}",
         table::render_table(
             theme,
-            &["PATH", "FILES", "SKIPPED", "MODE"],
+            &["ROOT", "FILES", "CHUNKS", "TIME", "DELTA", "MODE"],
             &rows,
-            &[false, true, true, false]
+            &[false, true, true, true, false, false]
         )
     );
-    for f in rep.files.iter().take(5) {
-        println!("{}", theme.muted(&format!("  {}", f.display())));
-    }
-    if rep.files.len() > 5 {
-        println!(
-            "{}",
-            theme.muted(&format!("  ... {} more", rep.files.len() - 5))
-        );
-    }
+    println!(
+        "{}",
+        panel::render_panel(
+            theme,
+            "Index",
+            &format!(
+                "version {} hash {}\ndir: {}\nask with: aicli ask \"query\" --index {} --show-sources",
+                rep.version, rep.config_hash, rep.dir, rep.root
+            )
+        )
+    );
     Ok(())
 }
 
@@ -1962,7 +2161,7 @@ fn cmd_doctor(
         output::print_json(
             true,
             Data {
-                version: "0.4.0".to_string(),
+                version: "1.0.0".to_string(),
                 profile: ctx.paths.profile.clone(),
                 config_file: ctx.paths.config_file.display().to_string(),
                 data_dir: ctx.paths.data_dir.display().to_string(),

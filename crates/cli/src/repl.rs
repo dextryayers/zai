@@ -55,7 +55,7 @@ pub async fn run_chat(
         "{}",
         status::status_line(
             theme,
-            "0.4.0",
+            "1.0.0",
             &model_id,
             0,
             n_ctx,

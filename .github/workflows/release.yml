@@ -14,9 +14,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: bash scripts/check-no-emdash.sh
+      - run: bash scripts/offline-test.sh
       - run: cargo build --locked --release -p aicli
       - run: tar -czf aicli-${{ matrix.os }}.tar.gz -C target/release aicli
+      - run: sha256sum aicli-${{ matrix.os }}.tar.gz > aicli-${{ matrix.os }}.tar.gz.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: aicli-${{ matrix.os }}
-          path: aicli-${{ matrix.os }}.tar.gz
+          path: |
+            aicli-${{ matrix.os }}.tar.gz
+            aicli-${{ matrix.os }}.tar.gz.sha256

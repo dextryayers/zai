@@ -100,9 +100,14 @@ pub enum Cmd {
     },
     /// Index a folder for RAG
     Index {
+        #[arg(default_value = ".")]
         path: PathBuf,
         #[arg(long, default_value_t = false)]
         rebuild: bool,
+        #[arg(long, default_value_t = false)]
+        eval: bool,
+        #[arg(long, default_value_t = false)]
+        status: bool,
     },
     /// Manage GGUF models
     Models {

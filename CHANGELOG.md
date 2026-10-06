@@ -2,6 +2,13 @@
 All notable changes to this project will be documented in this file.
 Format follows Keep a Changelog. Versions follow SemVer.
 
+## [1.0.0] - 2026-10-06
+### Added
+- Phase 6 RAG: chunk 512 plus 64 overlap with line anchors, hash embed dim 128 offline, cache sqlite FTS5 plus vectors, meta rag-v1 plus config hash with rebuild guard, incremental by mtime, fusion 0.5 plus 0.5 with dedupe, citations path plus lines plus scores, eval 10 of 10 pass
+- Phase 6 CLI: index build with animated counts, index status, index eval table, ask with --index plus --top-k plus --show-sources plus --no-rag, JSON sources with bm25 plus vector
+- Phase 7 hardening: bench script plus baselines, release with checksums plus gates, install script, security review with offline proof, docs plus benchmark table plus roadmap
+- v1 scope: mock inference with real GGUF validate, honest known limits for llama stream and ONNX upgrade
+
 ## [0.4.0] - 2026-10-06
 ### Added
 - Phase 4 agent: fs.read 200 lines plus 64 KB cap, fs.list 500 sorted, sandbox deny .. plus secret redact, git status plus diff 200 KB cap, events JSONL plus sqlite log

@@ -4,23 +4,31 @@
 
 ```text
 cli -> ui, core, models, infer, tools, rag, ingest
-rag -> ingest, core
+rag -> ingest
 tools -> ingest
 infer -> core, models
+core standalone
 ```
+
+No cycles. `cargo doc` warning free.
 
 ## Flows
 
-Chat mock in Phase 1: `repl::run_chat` calls `infer::mock_answer` and paces output.
-Real GGUF in Phase 2: replace `mock_answer` with `llama-cpp-2` loader plus token channel.
+Chat: REPL ensures sqlite session, builds prompt budget, streams mock tokens with caret, persists user plus assistant turns plus JSONL mirror. Real llama backend plugs into `infer::stream` callback shape.
 
-Code preview: `tools::search_files` plus `tools::validate_patch`, no writes in Phase 1.
+Ask with RAG: resolve index root from `--index` or config, `rag::retrieve` BM25 plus hash vectors fusion, inject top chunks into prompt, render answer plus sources panel with scores. `--no-rag` skips retrieval. Overflow exits 4.
+
+Code agent: search scope, read top hits in sandbox, draft grounded diff, validate hunks, save `pNNNN.diff`, prompt approval, atomic apply with backup, verify allowlisted command. Max 12 steps, dry run default.
+
+Index: walk with gitignore, chunk 512 plus 64 overlap, hash embed dim 128, store in cache sqlite FTS5 plus vectors JSON, meta with version plus config hash. Incremental by mtime plus size. Stale hash forces `--rebuild`.
 
 ## Storage
 
-Phase 1: JSON file `store.json` under profile data dir.
-Phase 3: migrate to sqlite per `migrations/001_init.sql` with same API shape.
+Profile `~/.local/share/aicli/profiles/default/db.sqlite` WAL: sessions, turns, tasks, notes, events, notes_fts.
+Mirrors: `sessions/<id>.jsonl`, `patches/<id>.diff`, `memory.md`, `logs/`.
+Cache `~/.cache/aicli/models/*.gguf`, `~/.cache/aicli/index/<slug>/index.sqlite` plus `meta.json`.
+Config `~/.config/aicli/config.toml` with env plus flag precedence.
 
-## Decisions
+## Decision log
 
-See `docs/DECISIONS.md` and `plan.md` Section 25.
+See `docs/DECISIONS.md` and `plan.md` Section 25. RAG uses sqlite FTS5 plus hash vectors, no ONNX download, single binary under 35 MB target.
