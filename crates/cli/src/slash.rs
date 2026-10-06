@@ -12,6 +12,8 @@ pub enum Slash {
         name: Option<String>,
         ctx: Option<u32>,
     },
+    Manage,
+    Ollama { op: String, arg: Option<String> },
     Setting {
         key: Option<String>,
         value: Option<String>,
@@ -64,6 +66,16 @@ pub const SLASHES: &[SlashMeta] = &[
         name: "/insert",
         desc: "Save a GGUF file into the model cache",
         usage: "/insert <file.gguf> [--name id] [--ctx n]",
+    },
+    SlashMeta {
+        name: "/manage",
+        desc: "Manage page for Ollama and GGUF",
+        usage: "/manage",
+    },
+    SlashMeta {
+        name: "/ollama",
+        desc: "Ollama list, pull, rm, show, status",
+        usage: "/ollama <list|pull|rm|show|status> [name]",
     },
     SlashMeta {
         name: "/setting",
@@ -195,6 +207,11 @@ pub fn parse(input: &str) -> Option<Slash> {
             }
         }
         "/effort" => Some(Slash::Effort(parts.first().cloned())),
+        "/manage" => Some(Slash::Manage),
+        "/ollama" => Some(Slash::Ollama {
+            op: parts.first().cloned().unwrap_or_else(|| "status".to_string()),
+            arg: parts.get(1).cloned(),
+        }),
         "/budget" => Some(Slash::Budget),
         "/ctx" if parts.first().map(|s| s.as_str()) == Some("compact") => Some(Slash::Compact),
         "/compact" => Some(Slash::Compact),
@@ -244,6 +261,21 @@ mod tests {
             Some(Slash::Effort(Some("High".to_string())))
         );
         assert_eq!(parse("hello"), None);
+        assert_eq!(parse("/manage"), Some(Slash::Manage));
+        assert_eq!(
+            parse("/ollama pull llama3.1"),
+            Some(Slash::Ollama {
+                op: "pull".to_string(),
+                arg: Some("llama3.1".to_string()),
+            })
+        );
+        assert_eq!(
+            parse("/ollama"),
+            Some(Slash::Ollama {
+                op: "status".to_string(),
+                arg: None,
+            })
+        );
     }
 
     #[test]

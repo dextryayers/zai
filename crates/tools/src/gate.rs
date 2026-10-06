@@ -1,8 +1,26 @@
-/// Shell permission gate. Denylist wins over allowlist.
+/// Shell permission gate. Denylist wins over allowlist in ask mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateDecision {
     Allow,
     Deny { reason: String, hint: String },
+}
+
+/// Mode aware gate. deny blocks everything, allow permits everything,
+/// anything else falls back to the ask allowlist.
+pub fn check_shell_full(
+    cmd: &str,
+    mode: &str,
+    allowlist: &[String],
+    denylist: &[String],
+) -> GateDecision {
+    match mode {
+        "deny" => GateDecision::Deny {
+            reason: "shell access disabled (mode deny)".to_string(),
+            hint: "enable with: zai config set shell ask".to_string(),
+        },
+        "allow" => GateDecision::Allow,
+        _ => check_shell(cmd, allowlist, denylist),
+    }
 }
 
 pub fn check_shell(cmd: &str, allowlist: &[String], denylist: &[String]) -> GateDecision {

@@ -12,12 +12,10 @@ pub async fn run_chat(
     ctx_n: Option<u32>,
 ) -> anyhow::Result<()> {
     let theme = &ctx.theme;
-    let model_id = model.unwrap_or_else(|| ctx.config.model.default.clone());
+    let mut model_id = model.unwrap_or_else(|| ctx.config.model.default.clone());
     let n_ctx = ctx_n.unwrap_or(ctx.config.model.n_ctx);
-    let sampler = aicli_infer::SamplerConfig::chat(
-        temp.or(Some(ctx.config.model.temp_chat)),
-        seed.unwrap_or(ctx.config.model.seed),
-    );
+    let mut effort = ctx.config.model.effort.clone();
+    let seed_val = seed.unwrap_or(ctx.config.model.seed);
 
     if ctx.is_json() {
         #[derive(Serialize)]
@@ -75,11 +73,11 @@ pub async fn run_chat(
             theme,
             &format!("Session {session_id}"),
             &format!(
-                "Title: {}\nTurns: {} {rec}\nModel {model_id} temp {:.1} seed {}\nType a message. /help for commands. {rail_hint}",
+                "Title: {}\nTurns: {} {rec}\nModel {model_id} effort {effort} temp {:.1} seed {}\nType a message. /help for commands. {rail_hint}",
                 sess.title,
                 existing.len(),
-                sampler.temp,
-                sampler.seed,
+                live_temp(temp, &effort, ctx),
+                seed_val,
                 rec = recovered
                     .map(|t| format!("(recovered stopped turn {})", t.id))
                     .unwrap_or_default(),
@@ -105,7 +103,17 @@ pub async fn run_chat(
                 if input == "/quit" || input == "/exit" || input == "exit" {
                     break;
                 }
-                if handle_slash(ctx, &conn, &session_id, &input, &mut show_sources).await? {
+                if handle_slash(
+                    ctx,
+                    &conn,
+                    &session_id,
+                    &input,
+                    &mut show_sources,
+                    &mut model_id,
+                    &mut effort,
+                )
+                .await?
+                {
                     continue;
                 }
                 // Build budget from live history.
@@ -156,7 +164,21 @@ pub async fn run_chat(
                 )?;
                 let _ = aicli_core::sessions::mirror_append(&ctx.paths.sessions_dir, &user_turn);
 
-                let answer = aicli_infer::sampler::mock_answer_with_sampler(&input, &sampler);
+                let routed = {
+                    let sampler = aicli_infer::SamplerConfig::chat(
+                        Some(live_temp(temp, &effort, ctx)),
+                        seed_val,
+                    );
+                    crate::answer::compose_answer(
+                        ctx,
+                        &input,
+                        &model_id,
+                        &sampler,
+                        &usage.prompt,
+                        n_ctx,
+                    )
+                };
+                let answer = routed.text;
                 println!(
                     "{} {}",
                     theme.bold("Zai"),
@@ -233,12 +255,20 @@ pub async fn run_chat(
     Ok(())
 }
 
+/// Effective chat temp: explicit flag wins, then a customized config value,
+/// then the effort profile.
+fn live_temp(flag: Option<f32>, effort: &str, ctx: &Ctx) -> f32 {
+    aicli_core::config::resolve_temp(flag, ctx.config.model.temp_chat, 0.6, effort)
+}
+
 async fn handle_slash(
     ctx: &Ctx,
     conn: &rusqlite::Connection,
     session_id: &str,
     input: &str,
     show_sources: &mut bool,
+    model_id: &mut String,
+    effort: &mut String,
 ) -> anyhow::Result<bool> {
     let theme = &ctx.theme;
     if !input.starts_with('/') {
@@ -333,12 +363,118 @@ async fn handle_slash(
         }
         ["/model", rest @ ..] => {
             if rest.is_empty() {
-                println!("model: {}", ctx.config.model.default);
+                let all = aicli_models::list_all(&ctx.paths.models_dir);
+                for m in &all {
+                    let mark = if m.id == ctx.config.model.default {
+                        "*"
+                    } else {
+                        " "
+                    };
+                    println!("{mark} {} ({}, {} MB)", m.id, m.quant, m.size_mb);
+                }
             } else {
+                let id = rest.join(" ");
+                if aicli_models::find_any(&ctx.paths.models_dir, id.trim()).is_some() {
+                    let mut cfg = ctx.config.clone();
+                    cfg.model.default = id.trim().to_string();
+                    cfg.save(&ctx.paths.config_file)?;
+                    *model_id = id.trim().to_string();
+                    println!("{}", theme.ok(&format!("active model: {}", id.trim())));
+                } else {
+                    println!("{}", theme.warn(&format!("unknown model {id}")));
+                }
+            }
+            Ok(true)
+        }
+        ["/insert", rest @ ..] => {
+            if rest.is_empty() {
                 println!(
-                    "model switch to {} takes effect next turn, GGUF validated on ask",
-                    rest.join(" ")
+                    "{}",
+                    theme.muted("usage: /insert <file.gguf> [--name id] [--ctx n]")
                 );
+                return Ok(true);
+            }
+            let mut args: Vec<String> = rest.iter().map(|s| s.to_string()).collect();
+            let take = |flag: &str, args: &mut Vec<String>| -> Option<String> {
+                args.iter().position(|a| a == flag).and_then(|i| {
+                    args.remove(i);
+                    if i < args.len() {
+                        Some(args.remove(i))
+                    } else {
+                        None
+                    }
+                })
+            };
+            let name = take("--name", &mut args);
+            let nctx = take("--ctx", &mut args).and_then(|v| v.parse::<u32>().ok());
+            let src = args.first().cloned().unwrap_or_default();
+            let src = if let Some(stripped) = src.strip_prefix("~/") {
+                std::env::var("HOME")
+                    .map(|h| format!("{h}/{stripped}"))
+                    .unwrap_or(src)
+            } else {
+                src
+            };
+            let src_path = std::path::PathBuf::from(&src);
+            for i in 0..3 {
+                print!(
+                    "\r{}",
+                    progress::spinner_line(theme, i, &format!("insert {}", src_path.display()))
+                );
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                std::thread::sleep(std::time::Duration::from_millis(60));
+            }
+            println!();
+            match aicli_models::insert_gguf(
+                &ctx.paths.models_dir,
+                &src_path,
+                name.as_deref(),
+                nctx,
+                |_, _| {},
+            ) {
+                Ok(entry) => println!(
+                    "{}",
+                    theme.ok(&format!("saved {} ({} MB)", entry.id, entry.size_mb))
+                ),
+                Err(e) => println!("{}", theme.danger(&format!("insert failed: {e}"))),
+            }
+            Ok(true)
+        }
+        ["/setting", "set", key, value] => {
+            match crate::settings::apply_setting(ctx, key, value) {
+                Ok(msg) => println!("{}", theme.ok(&msg)),
+                Err(e) => println!("{}", theme.warn(&e)),
+            }
+            Ok(true)
+        }
+        ["/setting"] => {
+            println!(
+                "{}",
+                aicli_ui::panel::render_panel(
+                    theme,
+                    "Settings",
+                    &crate::settings::settings_text(ctx, model_id)
+                )
+            );
+            Ok(true)
+        }
+        ["/effort", level] => {
+            match crate::settings::apply_effort(ctx, level) {
+                Ok(msg) => {
+                    *effort = (*level).to_string();
+                    println!("{}", theme.ok(&msg));
+                }
+                Err(e) => println!("{}", theme.warn(&e)),
+            }
+            Ok(true)
+        }
+        ["/effort"] => {
+            for l in aicli_core::config::EFFORT_LEVELS {
+                let mark = if *l == effort.as_str() { "*" } else { " " };
+                if let Some((temp, top_p, tokens, steps)) = aicli_core::config::effort_profile(l) {
+                    println!("{mark} {l}: temp {temp} top_p {top_p} tokens {tokens} steps {steps}");
+                }
             }
             Ok(true)
         }
@@ -419,6 +555,9 @@ async fn handle_slash(
                 "/sessions",
                 "/open",
                 "/model",
+                "/insert",
+                "/setting",
+                "/effort",
                 "/ctx",
                 "/temp",
                 "/index",

@@ -55,6 +55,20 @@ pub fn effort_profile(level: &str) -> Option<(f32, f32, usize, u32)> {
     }
 }
 
+/// Effective temp: explicit flag wins, then a customized config value,
+/// then the effort profile. Stock defaults are 0.6 chat and 0.2 code.
+pub fn resolve_temp(flag: Option<f32>, cfg_temp: f32, stock: f32, effort: &str) -> f32 {
+    if let Some(t) = flag {
+        return t;
+    }
+    if (cfg_temp - stock).abs() > f32::EPSILON {
+        return cfg_temp;
+    }
+    effort_profile(effort)
+        .map(|(t, _, _, _)| t)
+        .unwrap_or(cfg_temp)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexCfg {
     pub paths: Vec<String>,
@@ -73,6 +87,14 @@ pub struct ToolsCfg {
     pub auto_apply: bool,
     pub confirm_shell: bool,
     pub max_steps: u32,
+    /// Shell permission: deny blocks all, ask uses the allowlist with prompt,
+    /// allow runs any command without prompt. Only the user can set allow.
+    #[serde(default = "default_shell_mode")]
+    pub shell_mode: String,
+}
+
+fn default_shell_mode() -> String {
+    "ask".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +153,7 @@ impl Default for Config {
                 auto_apply: false,
                 confirm_shell: true,
                 max_steps: 12,
+                shell_mode: default_shell_mode(),
             },
             ui: UiCfg {
                 theme: "auto".to_string(),
@@ -182,6 +205,11 @@ impl Config {
                 self.model.effort = v;
             }
         }
+        if let Some(v) = env_first(&["ZAI_SHELL"]) {
+            if !v.is_empty() {
+                self.tools.shell_mode = v;
+            }
+        }
     }
 
     /// Write config back to file. Creates parent dirs.
@@ -214,6 +242,10 @@ impl Config {
             "effort must be one of Default Low Medium High XHigh Expert, got {}",
             self.model.effort
         );
+        anyhow::ensure!(
+            ["deny", "ask", "allow"].contains(&self.tools.shell_mode.as_str()),
+            "shell_mode must be deny, ask, or allow"
+        );
         Ok(())
     }
 }
@@ -239,6 +271,9 @@ mod tests {
         assert_eq!(effort_profile("Default"), Some((0.6, 0.9, 1024, 12)));
         assert_eq!(effort_profile("Expert"), Some((0.8, 0.95, 4096, 24)));
         assert_eq!(effort_profile("Nope"), None);
+        assert_eq!(resolve_temp(Some(0.1), 0.6, 0.6, "Expert"), 0.1);
+        assert_eq!(resolve_temp(None, 0.4, 0.6, "Expert"), 0.4);
+        assert_eq!(resolve_temp(None, 0.6, 0.6, "Low"), 0.3);
         let mut c = Config::default();
         c.model.effort = "Nope".to_string();
         assert!(c.validate().is_err());

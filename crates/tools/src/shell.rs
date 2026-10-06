@@ -2,25 +2,29 @@ use anyhow::{bail, Result};
 use std::path::Path;
 use std::time::Duration;
 
-use crate::gate::{check_shell, GateDecision};
+use crate::gate::{check_shell_full, GateDecision};
 
 /// Simpler correct capture with timeout via thread join. Preferred entry.
+/// Mode deny blocks everything, allow runs any command, ask uses the allowlist.
+/// Pipe from curl or wget to shell stays denied in ask mode only.
 pub fn run_blocking(
     cmd: &str,
     cwd: &Path,
+    mode: &str,
     allowlist: &[String],
     denylist: &[String],
     timeout: Duration,
     log_path: Option<&Path>,
 ) -> Result<(String, String, i32)> {
-    match check_shell(cmd, allowlist, denylist) {
+    match check_shell_full(cmd, mode, allowlist, denylist) {
         GateDecision::Allow => {}
         GateDecision::Deny { reason, hint } => {
             bail!("E_TOOL_DENIED: {reason}. {hint}");
         }
     }
     let lower = cmd.to_lowercase();
-    if (lower.contains("curl") || lower.contains("wget"))
+    if mode != "allow"
+        && (lower.contains("curl") || lower.contains("wget"))
         && (cmd.contains("| sh") || cmd.contains("| bash"))
     {
         bail!("E_TOOL_DENIED: pipe from curl or wget to shell is denied");
@@ -94,6 +98,7 @@ mod tests {
         let r = run_blocking(
             "git status",
             std::path::Path::new("."),
+            "ask",
             &allow,
             &deny,
             Duration::from_secs(10),
@@ -104,11 +109,40 @@ mod tests {
         let denied = run_blocking(
             "rm -rf /",
             std::path::Path::new("."),
+            "ask",
             &allow,
             &deny,
             Duration::from_secs(5),
             None,
         );
         assert!(denied.is_err());
+    }
+
+    #[test]
+    fn shell_modes() {
+        let (allow, deny) = lists();
+        // Deny mode blocks even allowlisted commands.
+        assert!(run_blocking(
+            "git status",
+            std::path::Path::new("."),
+            "deny",
+            &allow,
+            &deny,
+            Duration::from_secs(5),
+            None,
+        )
+        .is_err());
+        // Allow mode runs without allowlist membership.
+        let r = run_blocking(
+            "echo zai-full-access",
+            std::path::Path::new("."),
+            "allow",
+            &allow,
+            &deny,
+            Duration::from_secs(5),
+            None,
+        )
+        .unwrap();
+        assert!(r.0.contains("zai-full-access"));
     }
 }

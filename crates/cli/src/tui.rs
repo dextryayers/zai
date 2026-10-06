@@ -363,9 +363,34 @@ fn run_app(ctx: Ctx, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>)
         {
             if start.elapsed() > Duration::from_millis(450) {
                 let sampler = sampler_for_ctx(&ctx, &effort, None);
-                let answer = aicli_infer::sampler::mock_answer_with_sampler(q, &sampler);
-                persist_turns(&ctx, &session.id, q, &answer, "done");
-                messages.push(Msg::streaming(Role::Zai, &answer));
+                let history: Vec<(String, String)> =
+                    aicli_core::db::open(&ctx.paths.db_file)
+                        .ok()
+                        .and_then(|c| {
+                            aicli_core::sessions::list_turns(&c, &session.id).ok()
+                        })
+                        .map(|v| {
+                            v.into_iter().map(|t| (t.role, t.content)).collect()
+                        })
+                        .unwrap_or_default();
+                let prompt = aicli_infer::build_prompt(
+                    "You are Zai, a local assistant. Answer concisely.",
+                    &[],
+                    &history,
+                    q,
+                    ctx.config.model.n_ctx,
+                )
+                .prompt;
+                let routed = crate::answer::compose_answer(
+                    &ctx,
+                    q,
+                    &model_id,
+                    &sampler,
+                    &prompt,
+                    ctx.config.model.n_ctx,
+                );
+                persist_turns(&ctx, &session.id, q, &routed.text, "done");
+                messages.push(Msg::streaming(Role::Zai, &routed.text));
                 pending = Some(Pending::Streaming);
                 follow = true;
             }
@@ -716,7 +741,7 @@ fn draw(
             );
         }
         Overlay::Settings => {
-            let body = settings_text(ctx, model_id, effort);
+            let body = crate::settings::settings_text(ctx, model_id);
             let h = body.lines().count() as u16 + 4;
             let w = 62u16.min(area.width.saturating_sub(4));
             let popup = centered(area, w, h.min(area.height.saturating_sub(4)));
@@ -870,27 +895,12 @@ fn effort_rows(current: &str) -> Vec<(String, String, bool)> {
         .collect()
 }
 
-fn settings_text(ctx: &Ctx, model_id: &str, effort: &str) -> String {
-    let c = &ctx.config;
-    format!(
-        "model      {model_id}\neffort     {effort}\ntemp       {:.1} (chat) {:.1} (code)\ntop_p      {:.2}\nseed       {}\nctx        {}\nthreads    {}\ngpu_layers {}\ntheme      {}\n\nset with: /setting set <key> <value>\nkeys: model effort temp top_p seed ctx threads gpu_layers theme",
-        c.model.temp_chat,
-        c.model.temp_code,
-        c.model.top_p,
-        c.model.seed,
-        c.model.n_ctx,
-        c.model.n_threads,
-        c.model.n_gpu_layers,
-        c.ui.theme,
-    )
-}
-
 fn sampler_for_ctx(ctx: &Ctx, effort: &str, temp: Option<f32>) -> aicli_infer::SamplerConfig {
     let seed = ctx.config.model.seed;
-    let (etemp, etop_p, _, _) =
+    let (_, etop_p, _, _) =
         aicli_core::config::effort_profile(effort).unwrap_or((0.6, 0.9, 1024, 12));
     aicli_infer::SamplerConfig {
-        temp: temp.unwrap_or(etemp),
+        temp: aicli_core::config::resolve_temp(temp, ctx.config.model.temp_chat, 0.6, effort),
         top_p: etop_p,
         seed,
         mode: "chat".to_string(),
@@ -1290,7 +1300,7 @@ fn submit(
             }
             Slash::Setting { key, value } => {
                 if let (Some(k), Some(v)) = (key, value) {
-                    match apply_setting(ctx, &k, &v) {
+                    match crate::settings::apply_setting(ctx, &k, &v) {
                         Ok(msg) => *toast = Some((msg, Instant::now())),
                         Err(e) => {
                             messages.push(Msg::full(Role::Sys, &format!("setting error: {e}")))
@@ -1302,7 +1312,7 @@ fn submit(
             }
             Slash::Effort(level) => {
                 if let Some(l) = level {
-                    match apply_effort(ctx, &l) {
+                    match crate::settings::apply_effort(ctx, &l) {
                         Ok(msg) => {
                             *effort = l.clone();
                             *toast = Some((msg, Instant::now()));
@@ -1458,60 +1468,4 @@ fn shellexpand(path: &str) -> String {
         }
     }
     path.to_string()
-}
-
-fn apply_setting(ctx: &Ctx, key: &str, value: &str) -> Result<String, String> {
-    let mut cfg = ctx.config.clone();
-    match key {
-        "model" => cfg.model.default = value.to_string(),
-        "effort" => {
-            if aicli_core::config::effort_profile(value).is_none() {
-                return Err("effort must be Default Low Medium High XHigh Expert".to_string());
-            }
-            cfg.model.effort = value.to_string();
-        }
-        "temp" => {
-            cfg.model.temp_chat = value
-                .parse::<f32>()
-                .map_err(|_| "temp must be a number 0.0-2.0")?;
-            cfg.model.temp_code = cfg.model.temp_chat.min(0.5);
-        }
-        "top_p" => cfg.model.top_p = value.parse::<f32>().map_err(|_| "top_p must be a number")?,
-        "seed" => {
-            cfg.model.seed = value
-                .parse::<u64>()
-                .map_err(|_| "seed must be an integer")?
-        }
-        "ctx" => cfg.model.n_ctx = value.parse::<u32>().map_err(|_| "ctx must be an integer")?,
-        "threads" => {
-            cfg.model.n_threads = value
-                .parse::<u32>()
-                .map_err(|_| "threads must be an integer")?
-        }
-        "gpu_layers" => {
-            cfg.model.n_gpu_layers = value
-                .parse::<u32>()
-                .map_err(|_| "gpu_layers must be an integer")?
-        }
-        "theme" => cfg.ui.theme = value.to_string(),
-        _ => {
-            return Err(
-                "keys: model effort temp top_p seed ctx threads gpu_layers theme".to_string(),
-            )
-        }
-    }
-    cfg.save(&ctx.paths.config_file)
-        .map_err(|e| e.to_string())?;
-    Ok(format!("setting {key}={value}"))
-}
-
-fn apply_effort(ctx: &Ctx, level: &str) -> Result<String, String> {
-    if aicli_core::config::effort_profile(level).is_none() {
-        return Err("effort must be Default Low Medium High XHigh Expert".to_string());
-    }
-    let mut cfg = ctx.config.clone();
-    cfg.model.effort = level.to_string();
-    cfg.save(&ctx.paths.config_file)
-        .map_err(|e| e.to_string())?;
-    Ok(format!("effort {level}"))
 }

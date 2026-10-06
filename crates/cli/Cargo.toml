@@ -1,6 +1,6 @@
 [package]
 name = "zai"
-version = "1.1.0"
+version = "0.1.0-alpha"
 edition = "2021"
 description = "Zai AI offline coding and daily assistant"
 default-run = "zai"

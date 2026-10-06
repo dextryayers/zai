@@ -1,6 +1,8 @@
+pub mod answer;
 pub mod handlers;
 pub mod output;
 pub mod repl;
+pub mod settings;
 pub mod slash;
 pub mod tui;
 

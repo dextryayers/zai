@@ -108,21 +108,27 @@ fn sampler_for(
     mode: &str,
 ) -> aicli_infer::SamplerConfig {
     let seed = seed.unwrap_or(ctx.config.model.seed);
-    let (eff_temp, eff_top_p, _, _) = aicli_core::config::effort_profile(&ctx.config.model.effort)
+    let (_, eff_top_p, _, _) = aicli_core::config::effort_profile(&ctx.config.model.effort)
         .unwrap_or((0.6, 0.9, 1024, 12));
     match mode {
         "code" => aicli_infer::SamplerConfig {
-            temp: temp
-                .or(Some(ctx.config.model.temp_code))
-                .unwrap_or(eff_temp),
+            temp: aicli_core::config::resolve_temp(
+                temp,
+                ctx.config.model.temp_code,
+                0.2,
+                &ctx.config.model.effort,
+            ),
             top_p: eff_top_p,
             seed,
             mode: "code".to_string(),
         },
         _ => aicli_infer::SamplerConfig {
-            temp: temp
-                .or(Some(ctx.config.model.temp_chat))
-                .unwrap_or(eff_temp),
+            temp: aicli_core::config::resolve_temp(
+                temp,
+                ctx.config.model.temp_chat,
+                0.6,
+                &ctx.config.model.effort,
+            ),
             top_p: eff_top_p,
             seed,
             mode: "chat".to_string(),
@@ -154,7 +160,7 @@ fn cmd_ask(
     show_budget: bool,
 ) -> anyhow::Result<()> {
     let theme = &ctx.theme;
-    let (model_id, model_path, cached) = resolve_model(ctx, model_override);
+    let (model_id, _, _) = resolve_model(ctx, model_override);
     let sampler = sampler_for(ctx, temp, seed, "chat");
     let n_ctx = ctx.config.model.n_ctx;
 
@@ -265,30 +271,11 @@ fn cmd_ask(
         );
     }
 
-    // Backend status line: cached GGUF validated, else mock with fix.
-    let backend_note = if cached {
-        match model_path.as_ref() {
-            Some(p) => match aicli_infer::load_info(
-                p,
-                n_ctx,
-                ctx.config.model.n_threads,
-                ctx.config.model.n_gpu_layers,
-            ) {
-                Ok(info) => format!(
-                    "gguf v{} tensors {} size {} MB",
-                    info.gguf_version,
-                    info.tensor_count,
-                    info.size_bytes / (1024 * 1024)
-                ),
-                Err(e) => format!("backend warn: {e}"),
-            },
-            None => "mock backend".to_string(),
-        }
-    } else {
-        format!("mock backend, pull with: zai models pull {model_id}")
-    };
-
-    let answer = aicli_infer::sampler::mock_answer_with_sampler(query, &sampler);
+    // Shared router: local brain, then Ollama, then mock. See answer.rs.
+    let routed = crate::answer::compose_answer(ctx, query, &model_id, &sampler, &usage.prompt, n_ctx);
+    let backend_note = routed.backend_note;
+    let answer = routed.text;
+    let brain_kind = routed.brain;
 
     // Persist turns when session given. Create session id on demand.
     if let Some(sid) = session_opt.as_deref() {
@@ -339,6 +326,7 @@ fn cmd_ask(
             sampler: aicli_infer::SamplerConfig,
             usage: aicli_infer::PromptUsage,
             backend: String,
+            brain: Option<String>,
             sources: Vec<Source>,
         }
         let sources: Vec<Source> = retrieved
@@ -361,6 +349,7 @@ fn cmd_ask(
                 sampler,
                 usage,
                 backend: backend_note,
+                brain: brain_kind,
                 sources,
             },
         );
@@ -512,6 +501,17 @@ fn cmd_code(
         );
     }
 
+    // Brain static analysis of the top hit file. Read only, capped.
+    let analysis: Option<String> = hits.first().and_then(|h| {
+        let rel = pathdiff_rel(&root, &std::path::PathBuf::from(&h.file));
+        aicli_tools::fs_read(&root, &rel, 1, 200)
+            .ok()
+            .map(|(lines, _)| {
+                let report = aicli_infer::brain::code::analyze(&lines.join("\n"));
+                report.to_markdown()
+            })
+    });
+
     // Step 3 draft diff. Deterministic template grounded in search hits.
     let diff = draft_diff_for_goal(&root, goal, &hits);
     let file_count = aicli_tools::validate_patch(&diff, root.to_string_lossy().as_ref())
@@ -532,6 +532,7 @@ fn cmd_code(
             hits: usize,
             files: usize,
             diff: String,
+            analysis: Option<String>,
             sampler: aicli_infer::SamplerConfig,
             mode: String,
         }
@@ -543,6 +544,7 @@ fn cmd_code(
                 hits: hits.len(),
                 files: file_count,
                 diff: diff.clone(),
+                analysis: analysis.clone(),
                 sampler,
                 mode: if apply { "apply-requested" } else { "dry-run" }.to_string(),
             },
@@ -587,6 +589,10 @@ fn cmd_code(
             "{}",
             panel::render_panel(theme, "Diff preview", diff.trim())
         );
+        if let Some(report) = analysis.as_deref() {
+            let short: String = report.chars().take(1500).collect();
+            println!("{}", markdown::render_markdown(theme, &short));
+        }
         if !read_summaries.is_empty() {
             println!(
                 "{}",
@@ -691,8 +697,9 @@ fn cmd_code(
     let rust_touched = touched.iter().any(|p| p.ends_with(".rs"));
     if rust_touched {
         let verify_cmd = "cargo fmt --check";
-        if aicli_tools::check_shell(
+        if aicli_tools::check_shell_full(
             verify_cmd,
+            &ctx.config.tools.shell_mode,
             &ctx.config.tools.shell_allowlist,
             &ctx.config.tools.shell_denylist,
         ) == aicli_tools::GateDecision::Allow
@@ -702,6 +709,7 @@ fn cmd_code(
             match aicli_tools::run_blocking(
                 verify_cmd,
                 &root,
+                &ctx.config.tools.shell_mode,
                 &ctx.config.tools.shell_allowlist,
                 &ctx.config.tools.shell_denylist,
                 std::time::Duration::from_secs(60),
@@ -978,8 +986,9 @@ fn cmd_run(ctx: &Ctx, cmd: &[String]) -> anyhow::Result<()> {
         anyhow::bail!("usage: zai run -- <cmd...>");
     }
     // Gate first for fast deny with exit 5.
-    if let aicli_tools::GateDecision::Deny { reason, hint } = aicli_tools::check_shell(
+    if let aicli_tools::GateDecision::Deny { reason, hint } = aicli_tools::check_shell_full(
         &full,
+        &ctx.config.tools.shell_mode,
         &ctx.config.tools.shell_allowlist,
         &ctx.config.tools.shell_denylist,
     ) {
@@ -994,10 +1003,12 @@ fn cmd_run(ctx: &Ctx, cmd: &[String]) -> anyhow::Result<()> {
         std::process::exit(5);
     }
     // Confirm when required, unless auto yes env or JSON quiet automation.
+    // Full access mode skips the prompt but always logs the command.
     let auto_yes = std::env::var("ZAI_AUTO_YES")
         .or_else(|_| std::env::var("AICLI_AUTO_YES"))
         .is_ok();
-    let need_confirm = ctx.config.tools.confirm_shell && !auto_yes;
+    let need_confirm =
+        ctx.config.tools.shell_mode != "allow" && ctx.config.tools.confirm_shell && !auto_yes;
     if need_confirm && !ctx.is_json() {
         println!(
             "{}",
@@ -1026,9 +1037,16 @@ fn cmd_run(ctx: &Ctx, cmd: &[String]) -> anyhow::Result<()> {
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let logp = ctx.paths.logs_dir.join("run.log");
+    if ctx.config.tools.shell_mode == "allow" && !ctx.is_json() {
+        println!(
+            "{}",
+            theme.warn("full terminal access mode, running without prompt")
+        );
+    }
     match aicli_tools::run_blocking(
         &full,
         &cwd,
+        &ctx.config.tools.shell_mode,
         &ctx.config.tools.shell_allowlist,
         &ctx.config.tools.shell_denylist,
         std::time::Duration::from_secs(60),
@@ -2112,73 +2130,11 @@ fn cmd_config(ctx: &Ctx, op: &crate::ConfigOp) -> anyhow::Result<()> {
             Ok(())
         }
         crate::ConfigOp::Set { key, value } => {
-            // Short keys map to settings page rows. See /setting in TUI.
-            let mut cfg = ctx.config.clone();
-            let applied = match key.as_str() {
-                "model" | "model.default" => {
-                    cfg.model.default = value.clone();
-                    true
-                }
-                "effort" | "model.effort" => {
-                    if aicli_core::config::effort_profile(value).is_none() {
-                        anyhow::bail!("effort must be Default Low Medium High XHigh Expert");
-                    }
-                    cfg.model.effort = value.clone();
-                    true
-                }
-                "temp" => match value.parse::<f32>() {
-                    Ok(n) => {
-                        cfg.model.temp_chat = n;
-                        true
-                    }
-                    Err(_) => false,
-                },
-                "top_p" => match value.parse::<f32>() {
-                    Ok(n) => {
-                        cfg.model.top_p = n;
-                        true
-                    }
-                    Err(_) => false,
-                },
-                "seed" => match value.parse::<u64>() {
-                    Ok(n) => {
-                        cfg.model.seed = n;
-                        true
-                    }
-                    Err(_) => false,
-                },
-                "ctx" | "model.n_ctx" => match value.parse::<u32>() {
-                    Ok(n) => {
-                        cfg.model.n_ctx = n;
-                        true
-                    }
-                    Err(_) => false,
-                },
-                "threads" => match value.parse::<u32>() {
-                    Ok(n) => {
-                        cfg.model.n_threads = n;
-                        true
-                    }
-                    Err(_) => false,
-                },
-                "gpu_layers" => match value.parse::<u32>() {
-                    Ok(n) => {
-                        cfg.model.n_gpu_layers = n;
-                        true
-                    }
-                    Err(_) => false,
-                },
-                "theme" | "ui.theme" => {
-                    cfg.ui.theme = value.clone();
-                    true
-                }
-                _ => false,
-            };
-            if !applied {
-                anyhow::bail!("unknown key {key}, keys: model effort temp top_p seed ctx threads gpu_layers theme");
+            // Short keys map to the settings page rows. See /setting in TUI.
+            match crate::settings::apply_setting(ctx, key, value) {
+                Ok(msg) => println!("{}", theme.ok(&msg)),
+                Err(e) => anyhow::bail!("{e}"),
             }
-            cfg.save(&ctx.paths.config_file)?;
-            println!("{}", theme.ok(&format!("set {key}={value}")));
             Ok(())
         }
         crate::ConfigOp::Reset { yes } => {
