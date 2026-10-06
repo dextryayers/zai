@@ -66,6 +66,74 @@ impl Theme {
         Color::Cyan.bold().paint(s).to_string()
     }
 
+    pub fn accent2(&self, s: &str) -> String {
+        if !self.color {
+            return s.to_string();
+        }
+        Color::Purple.bold().paint(s).to_string()
+    }
+
+    pub fn user_tag(&self, s: &str) -> String {
+        if !self.color {
+            return s.to_string();
+        }
+        Color::Green.bold().paint(s).to_string()
+    }
+
+    pub fn zai_tag(&self, s: &str) -> String {
+        if !self.color {
+            return s.to_string();
+        }
+        Color::Cyan.bold().paint(s).to_string()
+    }
+
+    pub fn title(&self, s: &str) -> String {
+        if !self.color {
+            return s.to_string();
+        }
+        nu_ansi_term::Style::new()
+            .bold()
+            .fg(Color::White)
+            .paint(s)
+            .to_string()
+    }
+
+    pub fn banner(&self, s: &str) -> String {
+        if !self.color {
+            return s.to_string();
+        }
+        Color::Cyan.bold().paint(s).to_string()
+    }
+
+    pub fn ctx_style(&self, pct: usize, s: &str) -> String {
+        if !self.color {
+            return s.to_string();
+        }
+        if pct >= 85 {
+            Color::Yellow.bold().paint(s).to_string()
+        } else if pct >= 60 {
+            Color::Green.paint(s).to_string()
+        } else {
+            Color::DarkGray.paint(s).to_string()
+        }
+    }
+
+    pub fn divider(&self, width: usize) -> String {
+        let w = width.clamp(8, 120);
+        let ch = if self.unicode { '─' } else { '-' };
+        let line: String = std::iter::repeat_n(ch, w).collect();
+        self.muted(&line)
+    }
+
+    pub fn center_pad(&self, text: &str, width: usize) -> String {
+        let len = text.chars().count();
+        if len >= width {
+            return text.to_string();
+        }
+        let pad = (width - len) / 2;
+        format!("{}{}", " ".repeat(pad), text)
+    }
+
     pub fn ok(&self, s: &str) -> String {
         if !self.color {
             return s.to_string();

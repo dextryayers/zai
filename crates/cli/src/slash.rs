@@ -52,6 +52,11 @@ pub const SLASHES: &[SlashMeta] = &[
         usage: "/new [title]",
     },
     SlashMeta {
+        name: "/new-chat",
+        desc: "Start a new chat session",
+        usage: "/new-chat [title]",
+    },
+    SlashMeta {
         name: "/sessions",
         desc: "List sessions",
         usage: "/sessions",
@@ -118,7 +123,7 @@ pub const SLASHES: &[SlashMeta] = &[
     },
     SlashMeta {
         name: "/clear",
-        desc: "Clear screen view",
+        desc: "Clear entire chat log view",
         usage: "/clear",
     },
     SlashMeta {
@@ -186,6 +191,11 @@ pub fn parse(input: &str) -> Option<Slash> {
     match head.as_str() {
         "/help" => Some(Slash::Help),
         "/new" => Some(Slash::New(if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" "))
+        })),
+        "/new-chat" | "/newchat" | "/nc" => Some(Slash::New(if parts.is_empty() {
             None
         } else {
             Some(parts.join(" "))
@@ -301,5 +311,20 @@ mod tests {
         assert_eq!(complete("/").len(), SLASHES.len());
         assert_eq!(closest("/modle"), Some("/model"));
         assert_eq!(closest("/zzz"), None);
+    }
+
+    #[test]
+    fn parses_new_chat_aliases() {
+        assert_eq!(
+            parse("/new-chat my work"),
+            Some(Slash::New(Some("my work".to_string())))
+        );
+        assert_eq!(parse("/newchat"), Some(Slash::New(None)));
+        assert_eq!(
+            parse("/nc hello"),
+            Some(Slash::New(Some("hello".to_string())))
+        );
+        assert_eq!(parse("/clear"), Some(Slash::Clear));
+        assert!(complete("/new").iter().any(|m| m.name == "/new-chat"));
     }
 }

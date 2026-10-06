@@ -16,6 +16,78 @@ use std::time::{Duration, Instant};
 
 const SPIN: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// Centered welcome art with a unique block font. Rendered on boot
+/// splash and as the first chat banner. Pure ASCII plus box blocks
+/// so it stays sharp on all modern terminals.
+const WELCOME_ART: &[&str] = &[
+    "███████╗ █████╗ ██╗",
+    "╚══███╔╝██╔══██╗██║",
+    "  ███╔╝ ███████║██║",
+    " ███╔╝  ██╔══██║██║",
+    "███████╗██║  ██║██║",
+    "╚══════╝╚═╝  ╚═╝╚═╝",
+];
+
+const WELCOME_TITLE: &str = "Welcome to Zai";
+const WELCOME_SUB: &str = "Local-first offline assistant - chat, code, recall";
+const WELCOME_HINTS: &str = "Type a message or press / to see commands - Up/Down picks a command";
+
+fn welcome_text() -> String {
+    let mut s = String::new();
+    for line in WELCOME_ART {
+        s.push_str(line);
+        s.push('\n');
+    }
+    s.push_str(WELCOME_TITLE);
+    s.push('\n');
+    s.push_str(WELCOME_SUB);
+    s.push('\n');
+    s.push_str(WELCOME_HINTS);
+    s
+}
+
+fn welcome_banner_msg() -> String {
+    welcome_text()
+        + "\n\nQuick start:\n"
+        + "  /new-chat [title]  start a fresh chat session\n"
+        + "  /clear             clear entire chat log view\n"
+        + "  /model             list models, Enter switches\n"
+        + "  /help              full command palette\n"
+        + "\nKeys: Ctrl+N new  Ctrl+L clear  Ctrl+P palette  Ctrl+O models  F1 help  F3 rail"
+}
+
+fn new_chat_session(
+    ctx: &Ctx,
+    session: &mut aicli_core::sessions::Session,
+    sessions: &mut Vec<SessionRow>,
+    messages: &mut Vec<Msg>,
+    model_id: &str,
+    toast: &mut Option<(String, Instant)>,
+    title: Option<String>,
+) {
+    let t = title.unwrap_or_default();
+    if let Ok(conn) = aicli_core::db::open(&ctx.paths.db_file) {
+        if let Ok(s) = aicli_core::sessions::create_session(&conn, &t, model_id) {
+            *session = s;
+            *sessions = load_sessions(ctx);
+            messages.clear();
+            messages.push(Msg::full(Role::Sys, &welcome_banner_msg()));
+            messages.push(Msg::full(
+                Role::Sys,
+                &format!("New chat started: {}", session.id),
+            ));
+            *toast = Some((format!("new chat {}", session.id), Instant::now()));
+        }
+    }
+}
+
+fn clear_chat_log(messages: &mut Vec<Msg>, toast: &mut Option<(String, Instant)>) {
+    messages.clear();
+    messages.push(Msg::full(Role::Sys, &welcome_banner_msg()));
+    messages.push(Msg::full(Role::Sys, "Chat log cleared."));
+    *toast = Some(("chat cleared".to_string(), Instant::now()));
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Role {
     User,
@@ -340,13 +412,18 @@ fn run_app(ctx: Ctx, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>)
         .position(|s| s.id == session.id)
         .unwrap_or(0);
     let mut messages = load_messages(&ctx, &session.id);
-    messages.push(Msg::full(
-        Role::Sys,
-        "Welcome to Zai. Type a message or /help for commands.",
-    ));
+    if messages.is_empty() {
+        messages.push(Msg::full(Role::Sys, &welcome_banner_msg()));
+    } else {
+        messages.push(Msg::full(
+            Role::Sys,
+            "Welcome back. Press / for commands, Ctrl+N for new chat, F1 for help.",
+        ));
+    }
 
     let mut input = String::new();
     let mut cursor: usize = 0;
+    let mut slash_sel: Option<usize> = None;
     let mut history: Vec<String> = Vec::new();
     let mut hist_idx: Option<usize> = None;
     let mut overlay = Overlay::None;
@@ -469,8 +546,8 @@ fn run_app(ctx: Ctx, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>)
         terminal.draw(|f| {
             draw(
                 f, &ctx, version, &model_id, &effort, used, total, &sessions, sess_sel, &messages,
-                &input, cursor, &overlay, &toast, &pending, scroll, follow, focus_left, tick,
-                boot_until,
+                &input, cursor, slash_sel, &overlay, &toast, &pending, scroll, follow, focus_left,
+                tick, boot_until,
             );
         })?;
 
@@ -488,13 +565,77 @@ fn run_app(ctx: Ctx, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>)
                             continue;
                         }
                         (KeyCode::Char('d'), m) if m.contains(KeyModifiers::CONTROL) => break,
+                        (KeyCode::Char('n'), m) if m.contains(KeyModifiers::CONTROL) => {
+                            new_chat_session(
+                                &ctx,
+                                &mut session,
+                                &mut sessions,
+                                &mut messages,
+                                &model_id,
+                                &mut toast,
+                                None,
+                            );
+                            sess_sel = sessions
+                                .iter()
+                                .position(|s| s.id == session.id)
+                                .unwrap_or(0);
+                            input.clear();
+                            cursor = 0;
+                            slash_sel = None;
+                            follow = true;
+                            continue;
+                        }
+                        (KeyCode::Char('l'), m) if m.contains(KeyModifiers::CONTROL) => {
+                            clear_chat_log(&mut messages, &mut toast);
+                            follow = true;
+                            continue;
+                        }
+                        (KeyCode::Char('p'), m) if m.contains(KeyModifiers::CONTROL) => {
+                            overlay = Overlay::Help;
+                            continue;
+                        }
+                        (KeyCode::Char('o'), m) if m.contains(KeyModifiers::CONTROL) => {
+                            overlay = Overlay::Models {
+                                items: model_rows(&ctx, &model_id),
+                                sel: 0,
+                            };
+                            continue;
+                        }
+                        (KeyCode::Char('e'), m) if m.contains(KeyModifiers::CONTROL) => {
+                            let sel = aicli_core::config::EFFORT_LEVELS
+                                .iter()
+                                .position(|l| l == &effort)
+                                .unwrap_or(0);
+                            overlay = Overlay::Effort { sel };
+                            continue;
+                        }
+                        (KeyCode::Char('b'), m) if m.contains(KeyModifiers::CONTROL) => {
+                            let (u, t) = ctx_usage(&ctx, &session.id, "");
+                            messages.push(Msg::full(
+                                Role::Sys,
+                                &format!("budget {u}/{t} model {model_id} effort {effort}"),
+                            ));
+                            follow = true;
+                            continue;
+                        }
+                        (KeyCode::Char('s'), m) if m.contains(KeyModifiers::CONTROL) => {
+                            overlay = Overlay::Settings;
+                            continue;
+                        }
+                        (KeyCode::Char('u'), m) if m.contains(KeyModifiers::CONTROL) => {
+                            input.clear();
+                            cursor = 0;
+                            slash_sel = None;
+                            continue;
+                        }
                         _ => {}
                     }
                     if !handle_key(
                         &ctx,
-                        key.code,
+                        key,
                         &mut input,
                         &mut cursor,
+                        &mut slash_sel,
                         &mut history,
                         &mut hist_idx,
                         &mut overlay,
@@ -537,6 +678,7 @@ fn draw(
     messages: &[Msg],
     input: &str,
     cursor: usize,
+    slash_sel: Option<usize>,
     overlay: &Overlay,
     toast: &Option<(String, Instant)>,
     pending: &Option<Pending>,
@@ -556,20 +698,56 @@ fn draw(
         ])
         .split(area);
 
-    // Status bar.
+    // Premium status bar with segmented style and ctx meter.
     let pct = if total > 0 {
         used * 100 / total.max(1) as usize
     } else {
         0
     };
-    let status = format!(
-        "zai {version} | model {model_id} | effort {effort} | ctx {used}/{total} {pct}% | offline | {}",
-        ctx.paths.profile
-    );
-    f.render_widget(
-        Paragraph::new(status).style(Style::default().fg(Color::DarkGray)),
-        rows[0],
-    );
+    let ctx_color = if pct >= 85 {
+        Color::Yellow
+    } else if pct >= 60 {
+        Color::Green
+    } else {
+        Color::DarkGray
+    };
+    let bar_fill = pct.min(100) * 10 / 100;
+    let bar: String = (0..10)
+        .map(|i| if i < bar_fill { '#' } else { '-' })
+        .collect();
+    let status_line = Line::from(vec![
+        Span::styled(
+            " ZAI ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(format!("v{version}"), Style::default().fg(Color::DarkGray)),
+        Span::styled("  ◆ ", Style::default().fg(Color::Cyan)),
+        Span::styled(
+            model_id.to_string(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  ⚡ {effort}"),
+            Style::default().fg(Color::Magenta),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("ctx {used}/{total} {pct}% [{bar}]"),
+            Style::default().fg(ctx_color),
+        ),
+        Span::styled("  ● offline ", Style::default().fg(Color::Green)),
+        Span::styled(
+            format!("▣ {}", ctx.paths.profile),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(status_line), rows[0]);
 
     // Body columns.
     let cols = Layout::default()
@@ -577,15 +755,36 @@ fn draw(
         .constraints([Constraint::Length(30), Constraint::Min(1)])
         .split(rows[1]);
 
-    // Left: sessions.
+    // Left: sessions with premium active marker.
     let items: Vec<ListItem> = sessions
         .iter()
-        .map(|s| {
-            let head: String = s.title.chars().take(22).collect();
+        .enumerate()
+        .map(|(i, s)| {
+            let head: String = s.title.chars().take(20).collect();
+            let head = if head.trim().is_empty() {
+                s.id.clone()
+            } else {
+                head
+            };
+            let active = i == sess_sel.min(sessions.len().saturating_sub(1));
+            let marker = if active { "● " } else { "○ " };
+            let title_style = if active {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
             ListItem::new(vec![
-                Line::from(Span::styled(head, Style::default().fg(Color::White))),
+                Line::from(vec![
+                    Span::styled(
+                        marker.to_string(),
+                        Style::default().fg(if active { Color::Cyan } else { Color::DarkGray }),
+                    ),
+                    Span::styled(head, title_style),
+                ]),
                 Line::from(Span::styled(
-                    format!("{} turns", s.turns),
+                    format!("  {} turns", s.turns),
                     Style::default().fg(Color::DarkGray),
                 )),
             ])
@@ -593,10 +792,11 @@ fn draw(
         .collect();
     let left_block = Block::default()
         .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
         .title(if focus_left {
-            " Sessions (focused) "
+            " ● Sessions - Alt+2 to chat "
         } else {
-            " Sessions "
+            " ○ Sessions - Alt+1 to focus "
         })
         .border_style(Style::default().fg(if focus_left {
             Color::Cyan
@@ -614,33 +814,72 @@ fn draw(
         &mut state,
     );
 
-    // Main: messages.
+    // Main: premium message cards. User input uses green YOU card,
+    // AI answer uses cyan ZAI card with unique styling, system is muted.
     let mut lines: Vec<Line<'static>> = Vec::new();
     for m in messages {
-        let tag = match m.role {
-            Role::User => ("You", Color::Green),
-            Role::Zai => ("Zai", Color::Cyan),
-            Role::Sys => ("-", Color::DarkGray),
-        };
-        lines.push(Line::from(vec![
-            Span::styled(
-                tag.0.to_string(),
-                Style::default().fg(tag.1).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-        ]));
-        lines.extend(m.visible());
-        lines.push(Line::from(""));
+        match m.role {
+            Role::User => {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "● YOU ",
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("────────────────", Style::default().fg(Color::DarkGray)),
+                ]));
+                for l in m.visible() {
+                    let mut spans = vec![Span::styled(
+                        "┃ ".to_string(),
+                        Style::default().fg(Color::Green),
+                    )];
+                    spans.extend(l.spans);
+                    lines.push(Line::from(spans));
+                }
+                lines.push(Line::from(""));
+            }
+            Role::Zai => {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "◆ ZAI ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("────────────────", Style::default().fg(Color::DarkGray)),
+                ]));
+                for l in m.visible() {
+                    let mut spans = vec![Span::styled(
+                        "│ ".to_string(),
+                        Style::default().fg(Color::Cyan),
+                    )];
+                    spans.extend(l.spans);
+                    lines.push(Line::from(spans));
+                }
+                lines.push(Line::from(""));
+            }
+            Role::Sys => {
+                lines.push(Line::from(vec![Span::styled(
+                    "· ─ ─ ─".to_string(),
+                    Style::default().fg(Color::DarkGray),
+                )]));
+                lines.extend(m.visible());
+                lines.push(Line::from(""));
+            }
+        }
     }
     if let Some(Pending::Thinking { start, .. }) = pending {
         let frame = SPIN[tick % SPIN.len()];
         lines.push(Line::from(vec![
             Span::styled(
-                format!("{frame} thinking"),
-                Style::default().fg(Color::Cyan),
+                format!("{frame} ZAI is thinking"),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!(" {:.1}s", start.elapsed().as_secs_f32()),
+                format!(" {:.1}s - Ctrl+C stops", start.elapsed().as_secs_f32()),
                 Style::default().fg(Color::DarkGray),
             ),
         ]));
@@ -652,12 +891,14 @@ fn draw(
     } else {
         scroll.min(total_lines.saturating_sub(1))
     };
+    let scroll_tag = if follow { "" } else { " - PgDn to follow " };
     f.render_widget(
         Paragraph::new(lines)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" Chat ")
+                    .border_type(ratatui::widgets::BorderType::Rounded)
+                    .title(format!(" ◆ Chat{scroll_tag} "))
                     .border_style(Style::default().fg(Color::DarkGray)),
             )
             .wrap(Wrap { trim: false })
@@ -665,28 +906,45 @@ fn draw(
         cols[1],
     );
 
-    // Input with slash completion popup.
+    // Premium input with placeholder and shortcut hints.
     let before: String = input.chars().take(cursor).collect();
     let after: String = input.chars().skip(cursor).collect();
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
+    let input_line = if input.is_empty() {
+        Line::from(vec![
             Span::styled(
-                "> ",
+                "❯ ",
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(before),
             Span::styled("▍", Style::default().fg(Color::Cyan)),
-            Span::styled(after, Style::default().fg(Color::DarkGray)),
-        ]))
-        .block(
+            Span::styled(
+                " Type a message or press / for commands...".to_string(),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(
+                "❯ ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(before, Style::default().fg(Color::White)),
+            Span::styled("▍", Style::default().fg(Color::Cyan)),
+            Span::styled(after, Style::default().fg(Color::Gray)),
+        ])
+    };
+    f.render_widget(
+        Paragraph::new(input_line).block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(ratatui::widgets::BorderType::Rounded)
                 .title(if focus_left {
-                    " Input (Tab to focus) "
+                    " Input - Tab returns to chat "
                 } else {
-                    " Input "
+                    " Input - / commands - Ctrl+N new - Ctrl+L clear - F1 help "
                 })
                 .border_style(Style::default().fg(if focus_left {
                     Color::DarkGray
@@ -699,23 +957,56 @@ fn draw(
     if input.starts_with('/') && !input.contains(' ') {
         let matches = slash::complete(input);
         if !matches.is_empty() {
-            let items: Vec<ListItem> = matches
+            let sel = slash_sel.unwrap_or(0).min(matches.len().saturating_sub(1));
+            let visible: Vec<(usize, &&slash::SlashMeta)> =
+                matches.iter().enumerate().take(10).collect();
+            let items: Vec<ListItem> = visible
                 .iter()
-                .take(8)
-                .map(|m| {
+                .map(|(i, m)| {
+                    let active = *i == sel;
+                    let marker = if active { "> " } else { "  " };
+                    let style = if active {
+                        Style::default()
+                            .bg(Color::Cyan)
+                            .fg(Color::Black)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    };
                     ListItem::new(Line::from(vec![
-                        Span::styled(m.name.to_string(), Style::default().fg(Color::Cyan)),
+                        Span::styled(
+                            format!("{marker}{:<10}", m.name),
+                            if active {
+                                style
+                            } else {
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD)
+                            },
+                        ),
                         Span::raw(" "),
-                        Span::styled(m.desc.to_string(), Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            m.usage.to_string(),
+                            if active {
+                                Style::default().fg(Color::Black).bg(Color::Cyan)
+                            } else {
+                                Style::default().fg(Color::DarkGray)
+                            },
+                        ),
                     ]))
                 })
                 .collect();
-            let w = 56u16.min(area.width.saturating_sub(4));
-            let h = (items.len() as u16 + 2).min(10);
+            let w = 68u16.min(area.width.saturating_sub(4));
+            let h = (items.len() as u16 + 2).min(12);
             let popup = Rect::new(area.x + 2, rows[2].y.saturating_sub(h), w, h);
             f.render_widget(Clear, popup);
             f.render_widget(
-                List::new(items).block(Block::default().borders(Borders::ALL).title(" Commands ")),
+                List::new(items).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(ratatui::widgets::BorderType::Rounded)
+                        .title(" Commands - Up/Down select - Tab/Enter apply - Esc dismiss "),
+                ),
                 popup,
             );
         }
@@ -725,7 +1016,7 @@ fn draw(
     match overlay {
         Overlay::None => {}
         Overlay::Help => {
-            let rows: Vec<ListItem> = SLASHES
+            let mut rows: Vec<ListItem> = SLASHES
                 .iter()
                 .map(|m| {
                     ListItem::new(Line::from(vec![
@@ -734,7 +1025,40 @@ fn draw(
                     ]))
                 })
                 .collect();
-            popup_list(f, area, " Help - Esc to close ", &rows, None);
+            rows.push(ListItem::new(Line::from("")));
+            for (k, d) in [
+                ("Ctrl+N", "new chat"),
+                ("Ctrl+L", "clear log"),
+                ("Ctrl+P/F1", "this palette"),
+                ("Ctrl+O/F2", "models"),
+                ("Ctrl+E", "effort"),
+                ("Ctrl+B", "budget"),
+                ("Ctrl+S", "settings"),
+                ("Ctrl+U", "clear input"),
+                ("Up/Down", "pick / command or history"),
+                ("Tab/Enter", "apply command"),
+                ("PgUp/PgDn", "scroll chat"),
+                ("Alt+1/Alt+2", "sessions/chat focus"),
+                ("Ctrl+C/D", "stop/exit"),
+                ("F3", "toggle rail focus"),
+            ] {
+                rows.push(ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{k:<12}"),
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(d.to_string(), Style::default().fg(Color::Gray)),
+                ])));
+            }
+            popup_list(
+                f,
+                area,
+                " Help - Commands plus Shortcuts - Esc to close ",
+                &rows,
+                None,
+            );
         }
         Overlay::Models { items, sel } => {
             let rows: Vec<ListItem> = items
@@ -897,26 +1221,44 @@ fn draw(
         );
     }
 
-    // Boot splash.
+    // Centered premium boot splash with unique Welcome to Zai font.
     if Instant::now() < boot_until {
         let frame = SPIN[tick % SPIN.len()];
-        let popup = centered(area, 40, 5);
+        let popup = centered(area, 52.min(area.width.saturating_sub(4)), 13);
         f.render_widget(Clear, popup);
-        f.render_widget(
-            Paragraph::new(vec![
+        let mut splash: Vec<Line> = WELCOME_ART
+            .iter()
+            .map(|l| {
                 Line::from(Span::styled(
-                    "zai",
+                    l.to_string(),
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
-                )),
-                Line::from(Span::styled(
-                    format!("{frame} warming up local workspace"),
-                    Style::default().fg(Color::DarkGray),
-                )),
-            ])
-            .alignment(Alignment::Center)
-            .block(Block::default().borders(Borders::ALL)),
+                ))
+            })
+            .collect();
+        splash.push(Line::from(Span::styled(
+            WELCOME_TITLE.to_string(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )));
+        splash.push(Line::from(Span::styled(
+            WELCOME_SUB.to_string(),
+            Style::default().fg(Color::DarkGray),
+        )));
+        splash.push(Line::from(Span::styled(
+            format!("{frame} warming up local workspace"),
+            Style::default().fg(Color::DarkGray),
+        )));
+        f.render_widget(
+            Paragraph::new(splash).alignment(Alignment::Center).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(ratatui::widgets::BorderType::Rounded)
+                    .title(" ZAI ")
+                    .border_style(Style::default().fg(Color::Cyan)),
+            ),
             popup,
         );
     }
@@ -1094,9 +1436,10 @@ enum InsertMsg {
 #[allow(clippy::too_many_arguments)]
 fn handle_key(
     ctx: &Ctx,
-    code: crossterm::event::KeyCode,
+    key: crossterm::event::KeyEvent,
     input: &mut String,
     cursor: &mut usize,
+    slash_sel: &mut Option<usize>,
     history: &mut Vec<String>,
     hist_idx: &mut Option<usize>,
     overlay: &mut Overlay,
@@ -1114,7 +1457,47 @@ fn handle_key(
     effort: &mut String,
     insert_rx: &mut Option<mpsc::Receiver<InsertMsg>>,
 ) -> Result<bool> {
-    use crossterm::event::KeyCode;
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let code = key.code;
+    let mods = key.modifiers;
+    // Global premium shortcuts work even with overlays closed.
+    if *overlay == Overlay::None {
+        if mods.contains(KeyModifiers::ALT) {
+            match code {
+                KeyCode::Char('1') => {
+                    *focus_left = true;
+                    return Ok(true);
+                }
+                KeyCode::Char('2') => {
+                    *focus_left = false;
+                    return Ok(true);
+                }
+                _ => {}
+            }
+        }
+        match code {
+            KeyCode::F(1) => {
+                *overlay = Overlay::Help;
+                return Ok(true);
+            }
+            KeyCode::F(2) => {
+                *overlay = Overlay::Models {
+                    items: model_rows(ctx, model_id),
+                    sel: 0,
+                };
+                return Ok(true);
+            }
+            KeyCode::F(3) => {
+                *focus_left = !*focus_left;
+                *toast = Some((
+                    format!("focus {}", if *focus_left { "sessions" } else { "chat" }),
+                    Instant::now(),
+                ));
+                return Ok(true);
+            }
+            _ => {}
+        }
+    }
     // Overlay navigation first.
     match overlay {
         Overlay::Manage {
@@ -1253,10 +1636,59 @@ fn handle_key(
         Overlay::None => {}
     }
 
+    // Slash popup navigation has priority when typing a slash command.
+    // Up/Down moves selection, Tab/Enter applies it, Esc dismisses.
+    let slash_active = input.starts_with('/') && !input.contains(' ') && !*focus_left;
+    if slash_active {
+        let matches = slash::complete(input);
+        if !matches.is_empty() {
+            let len = matches.len();
+            match code {
+                KeyCode::Up => {
+                    let cur = slash_sel.unwrap_or(0);
+                    *slash_sel = Some(if cur == 0 { len - 1 } else { cur - 1 });
+                    return Ok(true);
+                }
+                KeyCode::Down => {
+                    let cur = slash_sel.unwrap_or(0);
+                    *slash_sel = Some((cur + 1) % len);
+                    return Ok(true);
+                }
+                KeyCode::Tab => {
+                    let sel = slash_sel.unwrap_or(0).min(len - 1);
+                    *input = format!("{} ", matches[sel].name);
+                    *cursor = input.chars().count();
+                    *slash_sel = None;
+                    return Ok(true);
+                }
+                KeyCode::Enter => {
+                    // If input is only a prefix, complete it instead of submitting.
+                    let sel = slash_sel.unwrap_or(0).min(len - 1);
+                    let picked = matches[sel].name.to_string();
+                    if input.trim() != picked {
+                        *input = format!("{picked} ");
+                        *cursor = input.chars().count();
+                        *slash_sel = None;
+                        return Ok(true);
+                    }
+                    // Exact match falls through to normal submit below.
+                }
+                KeyCode::Esc => {
+                    *slash_sel = None;
+                    input.clear();
+                    *cursor = 0;
+                    return Ok(true);
+                }
+                _ => {}
+            }
+        }
+    }
+
     match code {
         KeyCode::Esc => {
             input.clear();
             *cursor = 0;
+            *slash_sel = None;
             Ok(true)
         }
         KeyCode::Enter => {
@@ -1281,6 +1713,7 @@ fn handle_key(
             *hist_idx = None;
             input.clear();
             *cursor = 0;
+            *slash_sel = None;
             *follow = true;
             submit(
                 ctx,
@@ -1303,6 +1736,7 @@ fn handle_key(
                 chars.remove(*cursor - 1);
                 *input = chars.into_iter().collect();
                 *cursor -= 1;
+                *slash_sel = Some(0);
             }
             Ok(true)
         }
@@ -1328,6 +1762,7 @@ fn handle_key(
                 *hist_idx = Some(next.min(history.len() - 1));
                 *input = history[hist_idx.unwrap()].clone();
                 *cursor = input.chars().count();
+                *slash_sel = None;
             }
             Ok(true)
         }
@@ -1345,16 +1780,19 @@ fn handle_key(
                     input.clear();
                 }
                 *cursor = input.chars().count();
+                *slash_sel = None;
             }
             Ok(true)
         }
         KeyCode::Tab => {
-            // Complete slash command or toggle panel focus.
+            // Slash selection already handled above. Here Tab toggles focus
+            // or completes a common prefix when popup is visible.
             if input.starts_with('/') && !input.contains(' ') {
                 let matches = slash::complete(input);
                 if matches.len() == 1 {
                     *input = format!("{} ", matches[0].name);
                     *cursor = input.chars().count();
+                    *slash_sel = None;
                 } else if let Some(common) = common_prefix(&matches) {
                     if common.len() > input.len() {
                         *input = common;
@@ -1379,10 +1817,17 @@ fn handle_key(
             Ok(true)
         }
         KeyCode::Char(c) => {
+            // Alt combos already handled. Plain chars edit the input.
+            if mods.contains(KeyModifiers::ALT) || mods.contains(KeyModifiers::CONTROL) {
+                return Ok(true);
+            }
             let mut chars: Vec<char> = input.chars().collect();
             chars.insert(*cursor, c);
             *input = chars.into_iter().collect();
             *cursor += 1;
+            if input.starts_with('/') && !input.contains(' ') {
+                *slash_sel = Some(0);
+            }
             Ok(true)
         }
         _ => Ok(true),
@@ -1582,7 +2027,7 @@ fn submit(
                 *overlay = Overlay::Help;
             }
             Slash::Clear => {
-                messages.clear();
+                clear_chat_log(messages, toast);
             }
             Slash::Sessions => {
                 *sessions = load_sessions(ctx);
@@ -1594,15 +2039,7 @@ fn submit(
                 messages.push(Msg::full(Role::Sys, &format!("Sessions:\n{body}")));
             }
             Slash::New(title) => {
-                let t = title.unwrap_or_default();
-                if let Ok(conn) = aicli_core::db::open(&ctx.paths.db_file) {
-                    if let Ok(s) = aicli_core::sessions::create_session(&conn, &t, model_id) {
-                        *session = s;
-                        *sessions = load_sessions(ctx);
-                        messages.clear();
-                        messages.push(Msg::full(Role::Sys, &format!("New session {}", session.id)));
-                    }
-                }
+                new_chat_session(ctx, session, sessions, messages, model_id, toast, title);
             }
             Slash::Open(id) => {
                 if id.trim().is_empty() {

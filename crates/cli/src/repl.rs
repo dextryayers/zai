@@ -2,6 +2,94 @@ use crate::{output, Ctx};
 use aicli_ui::{markdown, progress, status};
 use serde::Serialize;
 
+const REPL_ART: &[&str] = &[
+    "███████╗ █████╗ ██╗",
+    "╚══███╔╝██╔══██╗██║",
+    "  ███╔╝ ███████║██║",
+    " ███╔╝  ██╔══██║██║",
+    "███████╗██║  ██║██║",
+    "╚══════╝╚═╝  ╚═╝╚═╝",
+];
+
+fn print_centered(theme: &aicli_ui::theme::Theme, text: &str) {
+    let w = theme.width.min(100);
+    for line in text.lines() {
+        let len = line.chars().count();
+        let pad = if len >= w { 0 } else { (w - len) / 2 };
+        println!("{}{}", " ".repeat(pad), theme.banner(line));
+    }
+}
+
+fn print_welcome_repl(theme: &aicli_ui::theme::Theme) {
+    for line in REPL_ART {
+        print_centered(theme, line);
+    }
+    print_centered(theme, "Welcome to Zai");
+    println!(
+        "{}",
+        theme.center_pad(
+            "Local-first offline assistant - chat, code, recall",
+            theme.width.min(100)
+        )
+    );
+    println!(
+        "{}",
+        theme.muted(
+            "Type a message or / for commands - /new-chat starts fresh - /clear wipes the view"
+        )
+    );
+    println!(
+        "{}",
+        theme.muted("Shortcuts: Ctrl+A/E line start/end - Ctrl+U clear line - Ctrl+L clear screen - Ctrl+R history - Tab completes /")
+    );
+}
+
+struct SlashCompleter;
+
+impl rustyline::completion::Completer for SlashCompleter {
+    type Candidate = String;
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &rustyline::Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<String>)> {
+        if !line[..pos.min(line.len())].starts_with('/') {
+            return Ok((0, vec![]));
+        }
+        let prefix: String = line[..pos.min(line.len())]
+            .split_whitespace()
+            .next()
+            .unwrap_or("/")
+            .to_string();
+        if prefix.contains(' ') {
+            return Ok((0, vec![]));
+        }
+        let out: Vec<String> = crate::slash::SLASHES
+            .iter()
+            .filter(|m| m.name.starts_with(prefix.as_str()))
+            .map(|m| format!("{} ", m.name))
+            .collect();
+        Ok((0, out))
+    }
+}
+
+impl rustyline::hint::Hinter for SlashCompleter {
+    type Hint = String;
+    fn hint(&self, line: &str, _pos: usize, _ctx: &rustyline::Context<'_>) -> Option<String> {
+        if !line.starts_with('/') || line.contains(' ') {
+            return None;
+        }
+        crate::slash::complete(line)
+            .first()
+            .map(|m| format!("  [{} - {}]", m.name, m.desc))
+    }
+}
+
+impl rustyline::highlight::Highlighter for SlashCompleter {}
+impl rustyline::validate::Validator for SlashCompleter {}
+impl rustyline::Helper for SlashCompleter {}
+
 /// Premium REPL with durable sessions, budget meter, and elegant streaming.
 pub async fn run_chat(
     ctx: &Ctx,
@@ -46,8 +134,9 @@ pub async fn run_chat(
     } else {
         aicli_core::sessions::ensure_session(&conn, None, &model_id)?
     };
-    let session_id = sess.id.clone();
+    let mut session_id = sess.id.clone();
 
+    print_welcome_repl(theme);
     println!(
         "{}",
         status::status_line(
@@ -63,18 +152,13 @@ pub async fn run_chat(
     // Show recovered stopped turn if last turn was partial.
     let existing = aicli_core::sessions::list_turns(&conn, &session_id)?;
     let recovered = existing.iter().rev().find(|t| t.status == "stopped");
-    let rail_hint = if ctx.config.ui.right_rail {
-        "rail on, F3 toggles in full TUI"
-    } else {
-        "rail off"
-    };
     println!(
         "{}",
         aicli_ui::panel::render_panel(
             theme,
             &format!("Session {session_id}"),
             &format!(
-                "Title: {}\nTurns: {} {rec}\nModel {model_id} effort {effort} temp {:.1} seed {}\nType a message. /help for commands. {rail_hint}",
+                "Title: {}\nTurns: {} {rec}\nModel {model_id} effort {effort} temp {:.1} seed {}\n/new-chat starts fresh - /clear wipes the view - /help lists all",
                 sess.title,
                 existing.len(),
                 live_temp(temp, &effort, ctx),
@@ -85,14 +169,18 @@ pub async fn run_chat(
             )
         )
     );
-    println!("{}", status::hint_line(theme));
+    println!(
+        "{}",
+        theme.muted("Keys: Up/Down history - Tab completes / - Ctrl+L clear - Ctrl+R search - Ctrl+C stop - Ctrl+D exit")
+    );
 
-    let mut rl = rustyline::DefaultEditor::new()?;
+    let mut rl = rustyline::Editor::<SlashCompleter, rustyline::history::DefaultHistory>::new()?;
+    rl.set_helper(Some(SlashCompleter));
     let _ = rl.load_history(ctx.paths.history_file.as_path());
     let mut show_sources = false;
 
     loop {
-        let prompt = format!("{} ", theme.accent("zai>"));
+        let prompt = format!("{} ", theme.accent("❯ zai>"));
         let line = rl.readline(&prompt);
         match line {
             Ok(input) => {
@@ -107,7 +195,7 @@ pub async fn run_chat(
                 if handle_slash(
                     ctx,
                     &conn,
-                    &session_id,
+                    &mut session_id,
                     &input,
                     &mut show_sources,
                     &mut model_id,
@@ -182,8 +270,14 @@ pub async fn run_chat(
                 };
                 let answer = routed.text;
                 println!(
+                    "{} {} {}",
+                    theme.user_tag("● YOU"),
+                    theme.muted("said:"),
+                    theme.muted(&input.chars().take(120).collect::<String>())
+                );
+                println!(
                     "{} {}",
-                    theme.bold("Zai"),
+                    theme.zai_tag("◆ ZAI"),
                     theme.muted(&format!("[{model_id}]"))
                 );
 
@@ -196,7 +290,7 @@ pub async fn run_chat(
                         progress::spinner_line(
                             theme,
                             i,
-                            &format!("thinking {:.1}s", t0.elapsed().as_secs_f32())
+                            &format!("ZAI is thinking {:.1}s", t0.elapsed().as_secs_f32())
                         )
                     );
                     use std::io::Write;
@@ -204,7 +298,9 @@ pub async fn run_chat(
                     std::thread::sleep(std::time::Duration::from_millis(60));
                 }
                 print!("\r");
+                println!("{}", theme.muted("────────────────"));
                 println!("{}", markdown::render_markdown(theme, &answer));
+                println!("{}", theme.muted("────────────────"));
                 let full = answer;
                 if show_sources {
                     println!(
@@ -267,7 +363,7 @@ fn live_temp(flag: Option<f32>, effort: &str, ctx: &Ctx) -> f32 {
 async fn handle_slash(
     ctx: &Ctx,
     conn: &rusqlite::Connection,
-    session_id: &str,
+    session_id: &mut String,
     input: &str,
     show_sources: &mut bool,
     model_id: &mut String,
@@ -286,21 +382,51 @@ async fn handle_slash(
                 aicli_ui::panel::render_panel(
                     theme,
                     "Commands",
-                    "/help /new [title] /sessions /open <id> /model [id]\n/manage /ollama <list|pull|rm|show> /insert <file.gguf> /setting [set k v] /effort [level]\n/budget /compact /export [md|json] /sources /plain /clear /quit\nKeys: Ctrl+C stop  Ctrl+D exit  Ctrl+L clear  Ctrl+R history"
+                    "/help /new [title] /new-chat [title] /sessions /open <id> /model [id]\n/manage /ollama <list|pull|rm|show> /insert <file.gguf> /setting [set k v] /effort [level]\n/budget /compact /export [md|json] /sources /plain /clear /quit\nKeys: Up/Down history - Tab completes / - Ctrl+A/E line - Ctrl+U clear line - Ctrl+L clear - Ctrl+R history - Ctrl+C stop - Ctrl+D exit"
                 )
+            );
+            println!(
+                "{}",
+                theme.muted("Tip: type / then press Tab to see all commands with hints.")
             );
             Ok(true)
         }
         ["/quit"] | ["/exit"] => std::process::exit(0),
         ["/clear"] => {
             print!("\x1B[2J\x1B[1;1H");
+            print_welcome_repl(theme);
+            println!(
+                "{}",
+                theme.ok("chat log view cleared, history kept in database")
+            );
             Ok(true)
         }
-        ["/new", rest @ ..] => {
+        ["/new", rest @ ..]
+        | ["/new-chat", rest @ ..]
+        | ["/newchat", rest @ ..]
+        | ["/nc", rest @ ..] => {
             let title = rest.join(" ");
-            let s = aicli_core::sessions::create_session(conn, &title, &ctx.config.model.default)?;
-            println!("{}", theme.ok(&format!("new session {}", s.id)));
-            std::process::exit(0);
+            let s = aicli_core::sessions::create_session(conn, &title, model_id)?;
+            *session_id = s.id.clone();
+            print!("\x1B[2J\x1B[1;1H");
+            print_welcome_repl(theme);
+            println!("{}", theme.ok(&format!("new chat started: {}", s.id)));
+            Ok(true)
+        }
+        ["/open", rest @ ..] => {
+            if rest.is_empty() {
+                println!("{}", theme.muted("usage: /open <id>"));
+                return Ok(true);
+            }
+            let id = rest.join(" ");
+            match aicli_core::sessions::get_session(conn, id.trim())? {
+                Some(s) => {
+                    *session_id = s.id.clone();
+                    println!("{}", theme.ok(&format!("opened session {}", s.id)));
+                }
+                None => println!("{}", theme.warn(&format!("unknown session {}", id.trim()))),
+            }
+            Ok(true)
         }
         ["/sessions"] => {
             let list = aicli_core::sessions::list_sessions(conn, 20)?;
