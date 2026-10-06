@@ -12,6 +12,10 @@ use ratatui::{
     widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap},
 };
 use std::sync::mpsc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 const SPIN: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -40,42 +44,33 @@ const WELCOME_ART: &[&str] = &[
 const WELCOME_TITLE: &str = "Welcome to Zai";
 const WELCOME_SUB: &str = "Local-first offline assistant - chat, code, recall";
 
-fn welcome_banner_msg() -> String {
-    "Fresh chat ready - pick an action above, or just type and press Enter.".to_string()
+/// Block font lines with a premium top to bottom gradient, cyan melting
+/// into magenta. Shared by the boot splash and the minimal stage hero.
+fn art_gradient() -> Vec<Line<'static>> {
+    const SHADES: [Color; 6] = [
+        Color::Cyan,
+        Color::LightCyan,
+        Color::LightBlue,
+        Color::Blue,
+        Color::Magenta,
+        Color::LightMagenta,
+    ];
+    WELCOME_ART
+        .iter()
+        .enumerate()
+        .map(|(i, art)| {
+            Line::from(Span::styled(
+                art.to_string(),
+                Style::default()
+                    .fg(SHADES[i % SHADES.len()])
+                    .add_modifier(Modifier::BOLD),
+            ))
+        })
+        .collect()
 }
 
-/// Quick start card for the minimal first-run stage. Never plain text:
-/// a bordered panel with the fastest actions plus the ready model line.
-fn quick_card_lines(model_id: &str, n_ctx: u32) -> Vec<Line<'static>> {
-    let row = |a: &str, b: &str| {
-        Line::from(vec![
-            Span::styled(
-                format!(" {a:<9}"),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(b.to_string(), Style::default().fg(Color::Gray)),
-        ])
-    };
-    vec![
-        row("type", "a message, Enter opens your tabs"),
-        row("/model", "switch the AI model"),
-        row("/insert", "add a GGUF file"),
-        row("/help", "all commands, ? works too"),
-        Line::from(vec![
-            Span::styled(
-                format!(" ◆ {} ready", truncate_model(model_id, 30)),
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(" · ctx {n_ctx}"),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]),
-    ]
+fn welcome_banner_msg() -> String {
+    "Fresh chat ready - pick an action above, or just type and press Enter.".to_string()
 }
 
 /// Centered logo stage for the minimal first-run view.
@@ -83,17 +78,12 @@ fn quick_card_lines(model_id: &str, n_ctx: u32) -> Vec<Line<'static>> {
 fn logo_lines(width: u16) -> Vec<Line<'static>> {
     let w = (width as usize).max(24);
     let mut out: Vec<Line<'static>> = Vec::new();
-    for art in WELCOME_ART {
-        let pad = (w.saturating_sub(art.chars().count())) / 2;
-        out.push(Line::from(vec![
-            Span::raw(" ".repeat(pad)),
-            Span::styled(
-                art.to_string(),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]));
+    for line in art_gradient() {
+        let len: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+        let pad = (w.saturating_sub(len)) / 2;
+        let mut spans = vec![Span::raw(" ".repeat(pad))];
+        spans.extend(line.spans);
+        out.push(Line::from(spans));
     }
     let centered = |t: &str, st: Style| {
         let pad = (w.saturating_sub(t.chars().count())) / 2;
@@ -102,7 +92,6 @@ fn logo_lines(width: u16) -> Vec<Line<'static>> {
             Span::styled(t.to_string(), st),
         ])
     };
-    out.push(Line::from(""));
     out.push(centered(
         WELCOME_TITLE,
         Style::default()
@@ -111,6 +100,19 @@ fn logo_lines(width: u16) -> Vec<Line<'static>> {
     ));
     out.push(centered(WELCOME_SUB, Style::default().fg(Color::DarkGray)));
     out
+}
+
+/// Full GGUF file name for the model bar. Falls back to the raw id when
+/// the model is not in the registry (for example ollama/ names).
+fn model_file_name(models_dir: &std::path::Path, model_id: &str) -> String {
+    aicli_models::find_any(models_dir, model_id)
+        .and_then(|e| {
+            aicli_models::local_path(models_dir, &e)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| model_id.to_string())
 }
 
 /// Shorten a model id from the left so the filename stays visible.
@@ -397,8 +399,54 @@ struct SessionRow {
 }
 
 enum Pending {
-    Thinking { input: String, start: Instant },
+    Thinking {
+        input: String,
+        start: Instant,
+    },
+    Waiting {
+        rx: mpsc::Receiver<crate::answer::Answer>,
+        cancel: Arc<AtomicBool>,
+    },
     Streaming,
+}
+
+/// Answer worker: real generation runs off the event loop thread so the
+/// UI never freezes. Cancel flag lets Ctrl+C kill the backend child.
+#[allow(clippy::too_many_arguments)]
+fn spawn_answer(
+    ctx: &Ctx,
+    query: String,
+    model_id: String,
+    sampler: aicli_infer::SamplerConfig,
+    prompt: String,
+    system: String,
+    chunks: Vec<String>,
+    history: Vec<(String, String)>,
+    n_ctx: u32,
+) -> (mpsc::Receiver<crate::answer::Answer>, Arc<AtomicBool>) {
+    let (tx, rx) = mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = cancel.clone();
+    let worker_ctx = ctx.clone();
+    std::thread::spawn(move || {
+        let parts = crate::answer::AskParts {
+            system: &system,
+            chunks: &chunks,
+            history: &history,
+        };
+        let ans = crate::answer::compose_answer(
+            &worker_ctx,
+            &query,
+            &model_id,
+            &sampler,
+            &prompt,
+            &parts,
+            n_ctx,
+            &worker_cancel,
+        );
+        let _ = tx.send(ans);
+    });
+    (rx, cancel)
 }
 
 pub fn launch(ctx: Ctx) -> Result<()> {
@@ -446,17 +494,49 @@ fn load_sessions(ctx: &Ctx) -> Vec<SessionRow> {
 
 /// Strip legacy mock artifacts from old stored turns on display.
 /// Early mock answers embedded a fake fenced block with fn apply_patch
-/// and a fake Sources section citing repo paths. The database keeps the
-/// original bytes untouched, but the chat view renders them cleaned so
-/// old history never looks like internal code. Returns cleaned text plus
-/// whether anything was removed.
+/// and a fake Sources section citing repo paths. A leaked raw backend dump
+/// (llama logo, info lines, prompt echo) is stripped the same way. The
+/// database keeps the original bytes untouched, but the chat view renders
+/// them cleaned so old history never looks like internal code. Returns
+/// cleaned text plus whether anything was removed.
 fn clean_legacy_mock(text: &str) -> (String, bool) {
+    fn is_logo_line(line: &str) -> bool {
+        let t = line.trim();
+        !t.is_empty()
+            && t.chars()
+                .all(|c| matches!(c, '█' | '▄' | '▀' | ' ' | '░' | '▒' | '▓'))
+    }
+    fn is_backend_info(line: &str) -> bool {
+        let t = line.trim_start();
+        ["build ", "model ", "ftype ", "modalities "]
+            .iter()
+            .any(|k| t.starts_with(k) && t.contains(':'))
+            || t == "available commands:"
+            || t == "using custom system prompt"
+            || (t.starts_with('/') && t.contains("  "))
+            || t.starts_with("[ Prompt")
+            || t.starts_with("Exiting")
+            || t.starts_with("Loading model")
+    }
     let lines: Vec<&str> = text.lines().collect();
+    // Aggressive echo stripping only when a backend dump is present, so
+    // genuine user quotes starting with > stay untouched.
+    let has_dump = lines.iter().any(|l| is_logo_line(l) || is_backend_info(l));
     let mut out: Vec<&str> = Vec::new();
     let mut removed = false;
     let mut i = 0;
     while i < lines.len() {
         let t = lines[i].trim_start();
+        if is_logo_line(lines[i]) || is_backend_info(lines[i]) {
+            removed = true;
+            i += 1;
+            continue;
+        }
+        if has_dump && (t.starts_with("> ") || t == ">") {
+            removed = true;
+            i += 1;
+            continue;
+        }
         if t.starts_with("```") {
             let mut j = i + 1;
             let mut is_legacy = false;
@@ -563,7 +643,7 @@ fn load_messages(ctx: &Ctx, session_id: &str) -> Vec<Msg> {
         out.push(Msg::full(
             Role::Sys,
             &format!(
-                "cleaned {cleaned} legacy mock block(s) from old history view - database untouched, new answers never contain them"
+                "cleaned {cleaned} legacy block(s) from old history view - old mock and backend chrome never render, database untouched, new answers are pure model text"
             ),
         ));
     }
@@ -633,6 +713,8 @@ fn run_app(ctx: Ctx, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>)
     let boot_until = Instant::now() + Duration::from_millis(600);
     let mut tick: usize = 0;
     let mut chat_turns = count_turns(&ctx, &session.id);
+    // Server dot cache: localhost probe roughly every five seconds.
+    let mut srv_cache: Option<(bool, usize)> = None;
     let mut usage_session = session.id.clone();
     // Context meter cache: recomputed roughly once a second or on input.
     let mut usage_cache: Option<(usize, u32, usize, String)> = None;
@@ -645,7 +727,8 @@ fn run_app(ctx: Ctx, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>)
                 toast = None;
             }
         }
-        // Thinking phase completes into streaming answer.
+        // Thinking phase spawns the answer worker once, then waits.
+        // Generation runs off the event loop so the UI never freezes.
         if let Some(Pending::Thinking {
             input: ref q,
             start,
@@ -666,26 +749,38 @@ fn run_app(ctx: Ctx, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>)
                     ctx.config.model.n_ctx,
                 )
                 .prompt;
-                let routed = crate::answer::compose_answer(
+                let (rx, cancel) = spawn_answer(
                     &ctx,
-                    q,
-                    &model_id,
-                    &sampler,
-                    &prompt,
+                    q.clone(),
+                    model_id.clone(),
+                    sampler,
+                    prompt,
+                    "You are Zai, a local assistant. Answer concisely.".to_string(),
+                    vec![],
+                    history,
                     ctx.config.model.n_ctx,
                 );
-                messages.push(Msg::streaming(Role::Zai, &routed.text));
-                // Truthful provenance line instead of fake citations.
-                // Only shown when the sources rail is on.
-                if show_sources {
-                    messages.push(Msg::full(
-                        Role::Sys,
-                        &format!("via {}", routed.backend_note),
-                    ));
-                }
-                pending = Some(Pending::Streaming);
-                follow = true;
+                pending = Some(Pending::Waiting { rx, cancel });
             }
+        }
+        // Answer arrived from the worker: reveal it with the stream effect.
+        let arrived = if let Some(Pending::Waiting { rx, .. }) = pending.as_ref() {
+            rx.try_recv().ok()
+        } else {
+            None
+        };
+        if let Some(routed) = arrived {
+            messages.push(Msg::streaming(Role::Zai, &routed.text));
+            // Truthful provenance line instead of fake citations.
+            // Only shown when the sources rail is on.
+            if show_sources {
+                messages.push(Msg::full(
+                    Role::Sys,
+                    &format!("via {}", routed.backend_note),
+                ));
+            }
+            pending = Some(Pending::Streaming);
+            follow = true;
         }
         // Advance streaming reveal on the newest unfinished message.
         // Scans from the tail so trailing done notes never block it.
@@ -711,6 +806,9 @@ fn run_app(ctx: Ctx, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>)
             if let Some(t) = finished_text {
                 persist_assistant(&ctx, &session.id, &t, "done");
                 chat_turns += 2;
+                if let Some(row) = sessions.iter_mut().find(|r| r.id == session.id) {
+                    row.turns += 2;
+                }
             }
         }
         // Insert progress pump.
@@ -795,6 +893,9 @@ fn run_app(ctx: Ctx, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>)
             chat_turns = count_turns(&ctx, &session.id);
             usage_cache = None;
         }
+        if srv_cache.map(|(_, at)| tick - at > 120).unwrap_or(true) {
+            srv_cache = Some((aicli_models::backend::server_running().is_some(), tick));
+        }
         // Context meter is cached: full history scan roughly once a
         // second or when the input changes, never every frame.
         let stale = match &usage_cache {
@@ -834,6 +935,7 @@ fn run_app(ctx: Ctx, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>)
                 boot_until,
                 &session.id,
                 chat_turns,
+                srv_cache.map(|(up, _)| up).unwrap_or(false),
             );
         })?;
 
@@ -852,6 +954,15 @@ fn run_app(ctx: Ctx, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>)
                                         Role::Sys,
                                         "cancelled before the answer started",
                                     ));
+                                }
+                                // Cancelled while the worker generates: flag
+                                // it so the backend child dies, drop the
+                                // answer when it lands.
+                                Some(Pending::Waiting { cancel, .. }) => {
+                                    cancel.store(true, Ordering::Relaxed);
+                                    pending = None;
+                                    messages
+                                        .push(Msg::full(Role::Sys, "cancelled, stopping backend"));
                                 }
                                 // Cancelled mid stream: save the real visible
                                 // prefix as a stopped turn, then freeze it.
@@ -995,18 +1106,14 @@ fn draw(
     boot_until: Instant,
     session_id: &str,
     session_turns: usize,
+    srv_up: bool,
 ) {
     let area = f.area();
-    // Black stage base so the whole UI sits on black in every terminal.
+    // Dark slate stage base so the whole UI sits on dark in every terminal.
     f.buffer_mut().set_style(area, dark_bg());
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
         .split(area);
 
     // View mode: minimal logo plus chat column until the first user message
@@ -1052,14 +1159,12 @@ fn draw(
         .map(|i| if i < bar_fill { '#' } else { '-' })
         .collect();
 
-    // Content column: centered like OpenCode, max 124 wide with gutters
-    // on wide terminals. Top brand line stays full width.
-    let content_w = area.width.min(124);
-    let content_x = area.x + area.width.saturating_sub(content_w) / 2;
-    let content = Rect::new(
-        content_x,
+    // Full terminal takeover: content spans the whole width, no gutters,
+    // no margins. Top brand line stays full width too.
+    let full_body = Rect::new(
+        area.x,
         rows[1].y,
-        content_w,
+        area.width,
         area.height.saturating_sub(rows[1].y),
     );
     let crows = Layout::default()
@@ -1067,9 +1172,9 @@ fn draw(
         .constraints([
             Constraint::Min(1),
             Constraint::Length(3),
-            Constraint::Length(1),
+            Constraint::Length(2),
         ])
-        .split(content);
+        .split(full_body);
 
     // Body: tabbed columns in full mode, logo stage plus full width chat
     // column in minimal mode.
@@ -1139,63 +1244,33 @@ fn draw(
         );
         cols[1]
     } else {
-        // Minimal stage: hero logo plus a quick start card above a full
-        // width chat column. Never a plain screen. Short terminals fall
-        // back to the boxed logo, tiny ones to chat only.
-        let body_h = crows[0].height;
-        if body_h >= 19 {
+        // Minimal stage: logo floating vertically centered plus the input
+        // column only. No chat panel, no cards, nothing plain. The model
+        // bar below still shows the active model from the first frame.
+        let clean_h = crows[0].height;
+        if clean_h >= 10 {
             let stage = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(9),
-                    Constraint::Length(7),
+                    Constraint::Min(1),
+                    Constraint::Length(8),
                     Constraint::Min(1),
                 ])
                 .split(crows[0]);
-            f.render_widget(Paragraph::new(logo_lines(stage[0].width)), stage[0]);
-            let card_w = stage[1].width.min(62);
-            let card_x = stage[1].x + stage[1].width.saturating_sub(card_w) / 2;
-            let card = Rect::new(card_x, stage[1].y, card_w, 7.min(stage[1].height));
-            clear_black(f, card);
-            f.render_widget(
-                Paragraph::new(quick_card_lines(model_id, ctx.config.model.n_ctx)).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(ratatui::widgets::BorderType::Rounded)
-                        .title(" Quick start ")
-                        .border_style(Style::default().fg(Color::Cyan)),
-                ),
-                card,
-            );
-            stage[2]
-        } else if body_h >= 13 {
-            let stage = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(11), Constraint::Min(1)])
-                .split(crows[0]);
-            f.render_widget(
-                Paragraph::new(logo_lines(stage[0].width)).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(ratatui::widgets::BorderType::Rounded)
-                        .title(" ZAI ")
-                        .border_style(Style::default().fg(Color::Cyan)),
-                ),
-                stage[0],
-            );
-            stage[1]
-        } else {
-            crows[0]
+            f.render_widget(Paragraph::new(logo_lines(stage[1].width)), stage[1]);
         }
+        crows[0]
     };
 
-    // Main: premium message cards. User input uses green YOU card,
-    // AI answer uses cyan ZAI card with unique styling, system is muted.
-    // Each card header carries the turn time so long histories stay clear.
+    // Main: premium message cards. Numbered exchanges, timed headers,
+    // green YOU cards, cyan ZAI cards with the answering model, muted sys.
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut exchange_no: usize = 0;
+    let zai_model = truncate_model(model_id, 18);
     for m in messages {
         match m.role {
             Role::User => {
+                exchange_no += 1;
                 lines.push(Line::from(vec![
                     Span::styled(
                         "● YOU ",
@@ -1204,7 +1279,10 @@ fn draw(
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(m.time.clone(), Style::default().fg(Color::DarkGray)),
-                    Span::styled(" ────────────────", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!(" #{exchange_no} ──────"),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                 ]));
                 for l in m.visible() {
                     let mut spans = vec![Span::styled(
@@ -1225,7 +1303,10 @@ fn draw(
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(m.time.clone(), Style::default().fg(Color::DarkGray)),
-                    Span::styled(" ────────────────", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!(" · {zai_model} ──"),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                 ]));
                 for l in m.visible() {
                     let mut spans = vec![Span::styled(
@@ -1247,47 +1328,96 @@ fn draw(
             }
         }
     }
-    if let Some(Pending::Thinking { start, .. }) = pending {
-        let frame = SPIN[tick % SPIN.len()];
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{frame} ZAI is thinking"),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(" {:.1}s - Ctrl+C stops", start.elapsed().as_secs_f32()),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
+    match pending {
+        Some(Pending::Thinking { start, .. }) => {
+            let frame = SPIN[tick % SPIN.len()];
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{frame} ZAI is thinking"),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" {:.1}s - Ctrl+C stops", start.elapsed().as_secs_f32()),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+        // Worker runs the real backend off thread: spinner with no timer.
+        Some(Pending::Waiting { .. }) => {
+            let frame = SPIN[tick % SPIN.len()];
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{frame} ZAI is generating"),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    " - Ctrl+C stops".to_string(),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+        _ => {}
     }
-    let total_lines = lines.len() as u16;
-    let view_h = chat_area.height.saturating_sub(2);
-    let offset = if follow {
-        total_lines.saturating_sub(view_h)
-    } else {
-        scroll.min(total_lines.saturating_sub(1))
-    };
-    let scroll_tag = if follow { "" } else { " - PgDn to follow " };
-    let chat_title = if minimal {
-        " Chat - type a message, Enter opens tabs ".to_string()
-    } else {
-        format!(" ◆ Chat{scroll_tag} ")
-    };
-    f.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(ratatui::widgets::BorderType::Rounded)
-                    .title(chat_title)
-                    .border_style(Style::default().fg(Color::DarkGray)),
-            )
-            .wrap(Wrap { trim: false })
-            .scroll((offset, 0)),
-        chat_area,
-    );
+    // Chat column only exists in full mode. Minimal shows the logo stage.
+    if show_rail {
+        let total_lines = lines.len() as u16;
+        let show_scrollbar = !follow && total_lines > chat_area.height.saturating_sub(2);
+        let chat_inner = if show_scrollbar {
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(1), Constraint::Length(1)])
+                .split(chat_area)[0]
+        } else {
+            chat_area
+        };
+        let view_h = chat_inner.height.saturating_sub(2);
+        let offset = if follow {
+            total_lines.saturating_sub(view_h)
+        } else {
+            scroll.min(total_lines.saturating_sub(1))
+        };
+        let scroll_tag = if follow { "" } else { " - PgDn to follow " };
+        let chat_title = if minimal {
+            " Chat - type a message, Enter opens tabs ".to_string()
+        } else {
+            format!(" ◆ Chat{scroll_tag} ")
+        };
+        f.render_widget(
+            Paragraph::new(lines)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(ratatui::widgets::BorderType::Rounded)
+                        .title(chat_title)
+                        .border_style(Style::default().fg(Color::DarkGray)),
+                )
+                .wrap(Wrap { trim: false })
+                .scroll((offset, 0)),
+            chat_inner,
+        );
+        if show_scrollbar {
+            let bar_area = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(1), Constraint::Length(1)])
+                .split(chat_area)[1];
+            let mut sb_state = ratatui::widgets::ScrollbarState::new(total_lines as usize)
+                .position(offset as usize)
+                .viewport_content_length(view_h as usize);
+            f.render_stateful_widget(
+                ratatui::widgets::Scrollbar::new(
+                    ratatui::widgets::ScrollbarOrientation::VerticalRight,
+                )
+                .thumb_style(Style::default().fg(Color::Cyan))
+                .track_style(Style::default().fg(Color::DarkGray)),
+                bar_area,
+                &mut sb_state,
+            );
+        }
+    }
 
     // Premium input with placeholder and shortcut hints.
     let before: String = input.chars().take(cursor).collect();
@@ -1335,21 +1465,32 @@ fn draw(
                 })
                 .border_style(Style::default().fg(if focus_left {
                     Color::DarkGray
+                } else if pending.is_some() {
+                    Color::Yellow
                 } else {
                     Color::Cyan
                 })),
         ),
         crows[1],
     );
-    // Model bar: always below the chat column, first frame to last.
-    // The active AI model never leaves this strip. Rich on wide screens,
-    // compact on narrow ones, never overflowing.
+    // Model bar: two lines always below the chat column, first frame to
+    // last. Line one carries the FULL GGUF file name, line two the facts.
+    // Rich on wide screens, compact on narrow ones, never overflowing.
     let sess_short: String = session_id.chars().take(8).collect();
+    let gguf_name = model_file_name(&ctx.paths.models_dir, model_id);
     let model_meta = aicli_models::find_any(&ctx.paths.models_dir, model_id)
         .map(|e| format!("{} · {} MB", e.quant, e.size_mb))
         .unwrap_or_default();
     let wide = crows[2].width >= 100;
-    let model_bar = if wide {
+    let name_line = if wide || gguf_name.chars().count() <= crows[2].width as usize - 6 {
+        gguf_name.clone()
+    } else {
+        truncate_model(
+            &gguf_name,
+            (crows[2].width as usize).saturating_sub(6).max(12),
+        )
+    };
+    let model_bar = vec![
         Line::from(vec![
             Span::styled(
                 " ◆ ",
@@ -1358,48 +1499,46 @@ fn draw(
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                truncate_model(model_id, 28),
+                name_line,
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(format!("  {model_meta}"), Style::default().fg(Color::Gray)),
-            Span::styled(
-                format!("  ⚡ {effort}"),
-                Style::default().fg(Color::Magenta),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                format!("ctx {used}/{total} {pct}% [{bar}]"),
-                Style::default().fg(ctx_color),
-            ),
-            Span::styled(
-                format!("  ▣ {} {session_turns}t {sess_short}", ctx.paths.profile),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])
-    } else {
-        Line::from(vec![
-            Span::styled(
-                " ◆ ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                truncate_model(model_id, 20),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled(format!("ctx {pct}%"), Style::default().fg(ctx_color)),
-            Span::styled(
-                format!("  {session_turns}t"),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])
-    };
+        ]),
+        if wide {
+            Line::from(vec![
+                Span::styled("   ", Style::default()),
+                Span::styled(format!("⚡ {effort}"), Style::default().fg(Color::Magenta)),
+                Span::raw("  "),
+                Span::styled(
+                    format!("ctx {used}/{total} {pct}% [{bar}]"),
+                    Style::default().fg(ctx_color),
+                ),
+                Span::styled(
+                    if srv_up { "  ● srv" } else { "  ○ srv" }.to_string(),
+                    Style::default().fg(if srv_up {
+                        Color::Green
+                    } else {
+                        Color::DarkGray
+                    }),
+                ),
+                Span::styled(
+                    format!("  ▣ {} {session_turns}t {sess_short}", ctx.paths.profile),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled("   ", Style::default()),
+                Span::styled(format!("ctx {pct}%"), Style::default().fg(ctx_color)),
+                Span::styled(
+                    format!("  {session_turns}t {sess_short}"),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])
+        },
+    ];
     f.render_widget(Paragraph::new(model_bar), crows[2]);
     if input.starts_with('/') && !input.contains(' ') {
         let matches = slash::complete(input);
@@ -1685,17 +1824,7 @@ fn draw(
         let frame = SPIN[tick % SPIN.len()];
         let popup = centered(area, 52.min(area.width.saturating_sub(4)), 13);
         clear_black(f, popup);
-        let mut splash: Vec<Line> = WELCOME_ART
-            .iter()
-            .map(|l| {
-                Line::from(Span::styled(
-                    l.to_string(),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ))
-            })
-            .collect();
+        let mut splash: Vec<Line> = art_gradient();
         splash.push(Line::from(Span::styled(
             WELCOME_TITLE.to_string(),
             Style::default()
@@ -1835,7 +1964,7 @@ fn effort_rows(current: &str) -> Vec<(String, String, bool)> {
 }
 
 fn sampler_for_ctx(ctx: &Ctx, effort: &str, temp: Option<f32>) -> aicli_infer::SamplerConfig {
-    let seed = ctx.config.model.seed;
+    let seed = aicli_infer::sampler::resolve_seed(None, ctx.config.model.seed);
     let (_, etop_p, _, _) =
         aicli_core::config::effort_profile(effort).unwrap_or((0.6, 0.9, 1024, 12));
     aicli_infer::SamplerConfig {
@@ -2807,6 +2936,21 @@ fn submit(
     // The question is stored before the answer exists, so history never
     // loses it even when the stream is cancelled halfway.
     persist_user(ctx, &session.id, text);
+    // Auto title: placeholder session names become the first user line so
+    // the sessions tabs stay readable instead of untitled spam.
+    if session.title == "untitled" || session.title.starts_with("chat ") {
+        let short: String = text.lines().next().unwrap_or("").chars().take(28).collect();
+        if !short.trim().is_empty() {
+            if let Ok(conn) = aicli_core::db::open(&ctx.paths.db_file) {
+                if aicli_core::sessions::rename_session(&conn, &session.id, &short).is_ok() {
+                    session.title = short.clone();
+                    if let Some(row) = sessions.iter_mut().find(|r| r.id == session.id) {
+                        row.title = short;
+                    }
+                }
+            }
+        }
+    }
     messages.push(Msg::full(Role::User, text));
     *pending = Some(Pending::Thinking {
         input: text.to_string(),
@@ -3001,6 +3145,22 @@ mod tests {
     }
 
     #[test]
+    fn backend_dump_is_stripped_on_display() {
+        let dump = "██ ██\nbuild      : b1-abc\nmodel      : /m.gguf\nftype      : Q6_K\nusing custom system prompt\navailable commands:\n  /exit or Ctrl+C     stop or exit\n> user: hai\nhai\nHello!\n[ Prompt: 1 ]\nExiting...\n";
+        let (clean, was) = clean_legacy_mock(dump);
+        assert!(was);
+        assert_eq!(clean, "hai\nHello!");
+    }
+
+    #[test]
+    fn user_quote_survives_without_dump() {
+        let text = "> Project Gutenberg quote\nnext line";
+        let (clean, was) = clean_legacy_mock(text);
+        assert!(!was);
+        assert_eq!(clean, text);
+    }
+
+    #[test]
     fn genuine_sources_tail_is_preserved() {
         let text = "answer here\n\nSources:\n- docs/guide.md:10-20 score=0.91";
         let (clean, was) = clean_legacy_mock(text);
@@ -3016,14 +3176,14 @@ mod tests {
     #[test]
     fn logo_lines_are_centered() {
         let lines = logo_lines(60);
-        assert_eq!(lines.len(), WELCOME_ART.len() + 3);
+        assert_eq!(lines.len(), WELCOME_ART.len() + 2);
         for l in &lines {
             let width: usize = l.spans.iter().map(|s| s.content.chars().count()).sum();
             assert!(width <= 60, "logo line overflows: {width}");
         }
         // Art block is wider than the title, so its padding is smaller.
         let art_pad = lines[0].spans[0].content.len();
-        let title_pad = lines[WELCOME_ART.len() + 1].spans[0].content.len();
+        let title_pad = lines[WELCOME_ART.len()].spans[0].content.len();
         assert!(art_pad < title_pad);
     }
 
@@ -3047,21 +3207,6 @@ mod tests {
             }
         }
         assert_ne!(DARK_BG, DARK_PANEL);
-    }
-
-    #[test]
-    fn quick_card_has_actions_and_ready_model() {
-        let lines = quick_card_lines("tiny-q4-k-m", 2048);
-        assert_eq!(lines.len(), 5);
-        let flat: String = lines
-            .iter()
-            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
-            .collect::<Vec<_>>()
-            .join("");
-        assert!(flat.contains("/model"));
-        assert!(flat.contains("/insert"));
-        assert!(flat.contains("tiny-q4-k-m"));
-        assert!(flat.contains("2048"));
     }
 
     #[test]

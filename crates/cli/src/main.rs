@@ -10,7 +10,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(
     name = "zai",
     version,
@@ -33,7 +33,7 @@ pub struct Cli {
     pub cmd: Option<Cmd>,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 pub enum Cmd {
     /// Start or resume interactive chat
     Chat {
@@ -190,9 +190,14 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         check_updates: bool,
     },
+    /// Local inference backend (llama.cpp): status and setup
+    Backend {
+        #[command(subcommand)]
+        op: BackendOp,
+    },
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 pub enum PatchOp {
     Show {
         #[arg(long)]
@@ -210,7 +215,7 @@ pub enum PatchOp {
     },
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 pub enum ModelsOp {
     List,
     Pull {
@@ -257,7 +262,7 @@ pub enum ModelsOp {
     },
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 pub enum OllamaOp {
     Status,
     List,
@@ -266,7 +271,7 @@ pub enum OllamaOp {
     Show { name: String },
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 pub enum TasksOp {
     Add {
         text: String,
@@ -292,7 +297,7 @@ pub enum TasksOp {
     },
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 pub enum NotesOp {
     Add {
         text: String,
@@ -310,7 +315,7 @@ pub enum NotesOp {
     },
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 pub enum SessionsOp {
     List,
     Open {
@@ -333,7 +338,7 @@ pub enum SessionsOp {
     },
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 pub enum ConfigOp {
     Show,
     Set {
@@ -346,13 +351,30 @@ pub enum ConfigOp {
     },
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 pub enum MemoryOp {
     Show,
     Add { text: String },
     Promote { session: String, turn: String },
 }
 
+#[derive(Subcommand, Debug, Clone)]
+pub enum BackendOp {
+    Status,
+    Setup {
+        /// llama.cpp tag to build, defaults to the pinned release.
+        #[arg(long)]
+        tag: Option<String>,
+    },
+    Serve {
+        /// Model id to serve. Defaults to the active model.
+        #[arg(long)]
+        model: Option<String>,
+    },
+    Stop,
+}
+
+#[derive(Debug, Clone)]
 pub struct Ctx {
     pub cli: Cli,
     pub paths: aicli_core::ProfilePaths,

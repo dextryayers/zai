@@ -47,6 +47,7 @@ zai ask "2+3*4"               local brain math, code review, security guides
 zai ask "<q>" --show-sources    cited answer, --no-rag to skip retrieval
 zai ask "<q>" --model ollama/llama3.1  answer via Ollama daemon
 zai ollama list|pull|rm       manage Ollama models
+zai backend status|setup    local llama.cpp backend for real GGUF answers
 zai run -- <cmd>              shell under deny plus ask plus allow gate
 zai code "<goal>" --apply       12 step loop, atomic patch, allowlisted verify
 zai patch show|apply|drop       inspect pending diffs

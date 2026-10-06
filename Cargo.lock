@@ -67,6 +67,7 @@ dependencies = [
 name = "aicli-models"
 version = "0.2.0"
 dependencies = [
+ "aicli-core",
  "aicli-ui",
  "anyhow",
  "indicatif",

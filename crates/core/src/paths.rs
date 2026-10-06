@@ -100,6 +100,46 @@ impl ProfilePaths {
     }
 }
 
+/// Profile independent shared data dir: `<base>/zai`.
+/// Test override first, then XDG, then HOME default.
+pub fn shared_data_dir() -> PathBuf {
+    if let Ok(test_home) =
+        std::env::var("ZAI_TEST_HOME").or_else(|_| std::env::var("AICLI_TEST_HOME"))
+    {
+        return PathBuf::from(test_home).join("share");
+    }
+    let base = std::env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            directories::BaseDirs::new()
+                .map(|b| b.data_dir().to_path_buf())
+                .unwrap_or_else(|| PathBuf::from("~/.local/share"))
+        });
+    base.join("zai")
+}
+
+/// Profile independent dir for helper binaries like llama-cli.
+pub fn shared_bin_dir() -> PathBuf {
+    shared_data_dir().join("bin")
+}
+
+/// Profile independent build cache dir for the local backend sources.
+pub fn shared_build_dir() -> PathBuf {
+    if let Ok(test_home) =
+        std::env::var("ZAI_TEST_HOME").or_else(|_| std::env::var("AICLI_TEST_HOME"))
+    {
+        return PathBuf::from(test_home).join("build");
+    }
+    let base = std::env::var("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            directories::BaseDirs::new()
+                .map(|b| b.cache_dir().to_path_buf())
+                .unwrap_or_else(|| PathBuf::from("~/.cache"))
+        });
+    base.join("zai").join("llama.cpp")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,6 +152,7 @@ mod tests {
         assert!(p.db_file.starts_with(tmp.path()));
         p.ensure().unwrap();
         assert!(p.sessions_dir.is_dir());
+        assert!(shared_bin_dir().starts_with(tmp.path()));
         std::env::remove_var("ZAI_TEST_HOME");
         std::env::remove_var("AICLI_TEST_HOME");
     }

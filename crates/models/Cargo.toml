@@ -12,6 +12,7 @@ reqwest = { workspace = true }
 sha2 = { workspace = true }
 indicatif = { workspace = true }
 walkdir = { workspace = true }
+aicli-core = { path = "../core" }
 aicli-ui = { path = "../ui" }
 
 [dev-dependencies]

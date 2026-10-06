@@ -104,7 +104,7 @@ pub async fn run_chat(
     let n_ctx = ctx_n.unwrap_or(ctx.config.model.n_ctx);
     let mut effort = ctx.config.model.effort.clone();
     let mut shell_mode = ctx.config.tools.shell_mode.clone();
-    let seed_val = seed.unwrap_or(ctx.config.model.seed);
+    let seed_val = aicli_infer::sampler::resolve_seed(seed, ctx.config.model.seed);
 
     if ctx.is_json() {
         #[derive(Serialize)]
@@ -271,16 +271,31 @@ pub async fn run_chat(
                         Some(live_temp(temp, &effort, ctx)),
                         seed_val,
                     );
+                    println!(
+                        "{}",
+                        theme.muted(&format!(
+                            "generating with {model_id} (timeout {}s)...",
+                            ctx.config.model.timeout_s.max(10)
+                        ))
+                    );
+                    let parts = crate::answer::AskParts {
+                        system: "You are Zai, a local assistant. Answer concisely.",
+                        chunks: &[],
+                        history: &hist,
+                    };
                     crate::answer::compose_answer(
                         ctx,
                         &input,
                         &model_id,
                         &sampler,
                         &usage.prompt,
+                        &parts,
                         n_ctx,
+                        &crate::answer::NO_CANCEL,
                     )
                 };
                 let answer = routed.text;
+                println!("{}", theme.muted(&routed.backend_note));
                 println!(
                     "{} {} {}",
                     theme.user_tag("● YOU"),
@@ -293,22 +308,8 @@ pub async fn run_chat(
                     theme.muted(&format!("[{model_id}]"))
                 );
 
-                // Thinking animation with elapsed timer, then one clean render.
-                // Single render avoids garbled caret overwrites on narrow terminals.
-                let t0 = std::time::Instant::now();
-                for i in 0..6 {
-                    print!(
-                        "\r{}",
-                        progress::spinner_line(
-                            theme,
-                            i,
-                            &format!("ZAI is thinking {:.1}s", t0.elapsed().as_secs_f32())
-                        )
-                    );
-                    use std::io::Write;
-                    let _ = std::io::stdout().flush();
-                    std::thread::sleep(std::time::Duration::from_millis(60));
-                }
+                // Single clean render, no fake spinner: generation above
+                // already took the real time.
                 print!("\r");
                 println!("{}", theme.muted("────────────────"));
                 println!("{}", markdown::render_markdown(theme, &answer));

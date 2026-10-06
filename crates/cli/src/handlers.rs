@@ -1,5 +1,7 @@
 use crate::MemoryOp;
-use crate::{output, repl, Cmd, Ctx, ModelsOp, NotesOp, OllamaOp, PatchOp, SessionsOp, TasksOp};
+use crate::{
+    output, repl, BackendOp, Cmd, Ctx, ModelsOp, NotesOp, OllamaOp, PatchOp, SessionsOp, TasksOp,
+};
 use aicli_ui::{markdown, panel, progress, status, table};
 use serde::Serialize;
 
@@ -90,6 +92,7 @@ pub async fn dispatch(ctx: Ctx) -> anyhow::Result<()> {
         Some(Cmd::Sessions { op }) => cmd_sessions(&ctx, op),
         Some(Cmd::Config { op }) => cmd_config(&ctx, op),
         Some(Cmd::Memory { op }) => cmd_memory(&ctx, op),
+        Some(Cmd::Backend { op }) => cmd_backend(&ctx, op),
         Some(Cmd::Doctor {
             bench_load,
             bench_gen,
@@ -115,7 +118,7 @@ fn sampler_for(
     seed: Option<u64>,
     mode: &str,
 ) -> aicli_infer::SamplerConfig {
-    let seed = seed.unwrap_or(ctx.config.model.seed);
+    let seed = aicli_infer::sampler::resolve_seed(seed, ctx.config.model.seed);
     let (_, eff_top_p, _, _) = aicli_core::config::effort_profile(&ctx.config.model.effort)
         .unwrap_or((0.6, 0.9, 1024, 12));
     match mode {
@@ -279,9 +282,32 @@ fn cmd_ask(
         );
     }
 
-    // Shared router: local brain, then Ollama, then mock. See answer.rs.
-    let routed =
-        crate::answer::compose_answer(ctx, query, &model_id, &sampler, &usage.prompt, n_ctx);
+    // Shared router: local brain, Ollama, local GGUF, then mock. See answer.rs.
+    // Real generation blocks here; the timeout in config bounds the wait.
+    if !ctx.is_json() && !ctx.is_quiet() {
+        println!(
+            "{}",
+            theme.muted(&format!(
+                "generating with {model_id} (timeout {}s)...",
+                ctx.config.model.timeout_s.max(10)
+            ))
+        );
+    }
+    let parts = crate::answer::AskParts {
+        system: "You are Zai, a local assistant. Answer concisely. Use provided sources first and cite paths.",
+        chunks: &chunks,
+        history: &history,
+    };
+    let routed = crate::answer::compose_answer(
+        ctx,
+        query,
+        &model_id,
+        &sampler,
+        &usage.prompt,
+        &parts,
+        n_ctx,
+        &crate::answer::NO_CANCEL,
+    );
     let backend_note = routed.backend_note;
     let answer = routed.text;
     let brain_kind = routed.brain;
@@ -1862,6 +1888,177 @@ fn cmd_models(ctx: &Ctx, op: &ModelsOp) -> anyhow::Result<()> {
     }
 }
 
+fn cmd_backend(ctx: &Ctx, op: &BackendOp) -> anyhow::Result<()> {
+    let theme = &ctx.theme;
+    match op {
+        BackendOp::Status => {
+            let st = aicli_models::backend::backend_state();
+            if ctx.is_json() {
+                output::print_json(true, &st);
+                return Ok(());
+            }
+            let mut rows = vec![
+                vec![
+                    "binary".to_string(),
+                    st.binary
+                        .clone()
+                        .unwrap_or_else(|| "missing, run: zai backend setup".to_string()),
+                ],
+                vec![
+                    "version".to_string(),
+                    st.version.clone().unwrap_or_else(|| "-".to_string()),
+                ],
+                vec!["source".to_string(), st.source_dir.clone()],
+                vec![
+                    "source present".to_string(),
+                    if st.source_present {
+                        "yes".to_string()
+                    } else {
+                        "no".to_string()
+                    },
+                ],
+                vec!["pinned tag".to_string(), st.tag.clone()],
+            ];
+            rows.push(vec![
+                "server".to_string(),
+                match &st.server {
+                    Some(srv) => format!("up {} ({})", srv.model, srv.port),
+                    None => "down, starts on first GGUF answer or: zai backend serve".to_string(),
+                },
+            ]);
+            println!(
+                "{}",
+                table::render_table(theme, &["KEY", "VALUE"], &rows, &[false, false])
+            );
+            if st.binary.is_none() {
+                println!(
+                    "{}",
+                    theme.muted("real GGUF answers need the binary, run: zai backend setup")
+                );
+            }
+            Ok(())
+        }
+        BackendOp::Setup { tag } => {
+            let tag = tag
+                .clone()
+                .unwrap_or_else(|| aicli_models::backend::LLAMA_TAG.to_string());
+            if !ctx.is_json() {
+                println!("{}", theme.bold(&format!("backend setup tag {tag}")));
+                println!(
+                    "{}",
+                    theme.muted("clone plus cmake plus compile, several minutes on first run")
+                );
+            }
+            match aicli_models::backend::setup_llama(&tag, |stage| {
+                if !ctx.is_json() {
+                    println!("{}", theme.muted(&format!("backend setup: {stage}")));
+                }
+            }) {
+                Ok(bin) => {
+                    // Share one build system wide when allowed.
+                    let sys = std::path::PathBuf::from("/usr/local/bin/llama-cli");
+                    if sys != bin && std::fs::copy(&bin, &sys).is_ok() {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            let _ = std::fs::set_permissions(
+                                &sys,
+                                std::fs::Permissions::from_mode(0o755),
+                            );
+                        }
+                        if !ctx.is_json() {
+                            println!("{}", theme.muted(&format!("shared at {}", sys.display())));
+                        }
+                    }
+                    if ctx.is_json() {
+                        output::print_json(true, serde_json::json!({"binary": bin}));
+                    } else {
+                        println!("{}", theme.ok(&format!("backend ready: {}", bin.display())));
+                        if let Some(v) = aicli_models::backend::llama_version(&bin) {
+                            println!("{}", theme.muted(&v));
+                        }
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    if ctx.is_json() {
+                        output::print_json_error(
+                            "E_BACKEND",
+                            &e.to_string(),
+                            "check git, cmake, and network",
+                        );
+                    } else {
+                        println!("{}", theme.danger(&format!("backend setup failed: {e}")));
+                    }
+                    anyhow::bail!("{e}");
+                }
+            }
+        }
+        BackendOp::Serve { model } => {
+            let id = model
+                .clone()
+                .unwrap_or_else(|| ctx.config.model.default.clone());
+            let entry = aicli_models::find_any(&ctx.paths.models_dir, &id)
+                .ok_or_else(|| anyhow::anyhow!("unknown model {id}"))?;
+            let path = aicli_models::local_path(&ctx.paths.models_dir, &entry);
+            anyhow::ensure!(path.exists(), "model file not cached: {}", path.display());
+            if !ctx.is_json() {
+                println!(
+                    "{}",
+                    theme.muted(&format!(
+                        "serving {} (first load takes a while)...",
+                        entry.file
+                    ))
+                );
+            }
+            match aicli_models::backend::start_server(
+                &path,
+                entry.n_ctx.max(2048),
+                aicli_infer::local::inference_threads(ctx.config.model.n_threads),
+            ) {
+                Ok(info) => {
+                    if ctx.is_json() {
+                        output::print_json(true, &info);
+                    } else {
+                        println!(
+                            "{}",
+                            theme.ok(&format!("server up {} on {}", info.model, info.port))
+                        );
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    if ctx.is_json() {
+                        output::print_json_error(
+                            "E_BACKEND",
+                            &e.to_string(),
+                            "check the server log",
+                        );
+                    } else {
+                        println!("{}", theme.danger(&format!("serve failed: {e}")));
+                    }
+                    anyhow::bail!("{e}");
+                }
+            }
+        }
+        BackendOp::Stop => {
+            match aicli_models::backend::stop_server()? {
+                true => {
+                    if ctx.is_json() {
+                        output::print_json(true, serde_json::json!({"stopped": true}));
+                    } else {
+                        println!("{}", theme.ok("server stopped"));
+                    }
+                }
+                false => {
+                    println!("{}", theme.muted("no server running"));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 fn cmd_ollama(ctx: &Ctx, op: &OllamaOp) -> anyhow::Result<()> {
     use aicli_models::ollama as ol;
     let theme = &ctx.theme;
@@ -2637,6 +2834,7 @@ fn cmd_doctor(
             shell_mode: String,
             ollama_daemon: bool,
             brain_ok: bool,
+            backend_ready: bool,
         }
         let entry = aicli_models::find_any(&ctx.paths.models_dir, &ctx.config.model.default);
         let cached = entry
@@ -2659,6 +2857,7 @@ fn cmd_doctor(
                 shell_mode: ctx.config.tools.shell_mode.clone(),
                 ollama_daemon: aicli_models::ollama::daemon_reachable(),
                 brain_ok: aicli_infer::brain::math::eval("7*6").ok() == Some(42.0),
+                backend_ready: aicli_models::backend::find_llama_cli().is_some(),
             },
         );
         return Ok(());
@@ -2707,6 +2906,23 @@ fn cmd_doctor(
             ),
         ],
         vec!["ollama".to_string(), ollama_state],
+        vec![
+            "backend".to_string(),
+            match aicli_models::backend::find_llama_cli() {
+                Some(b) => {
+                    let v = aicli_models::backend::llama_version(&b).unwrap_or_default();
+                    format!("llama-cli ready {} ({})", v, b.display())
+                }
+                None => "missing, run: zai backend setup".to_string(),
+            },
+        ],
+        vec![
+            "server".to_string(),
+            match aicli_models::backend::server_running() {
+                Some(s) => format!("up {} on {}", s.model, s.port),
+                None => "down, auto starts on first GGUF answer".to_string(),
+            },
+        ],
         vec![
             "brain".to_string(),
             if brain_ok {

@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+pub mod backend;
 pub mod ollama;
 
 /// Run blocking HTTP work on a dedicated OS thread.

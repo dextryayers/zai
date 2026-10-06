@@ -38,6 +38,30 @@ impl SamplerConfig {
     }
 }
 
+/// Seed resolution: explicit flag wins, then a pinned nonzero config
+/// seed, else fresh randomness per request. A fixed default seed freezes
+/// sampling, so every identical prompt returns the identical answer with
+/// identical quirks forever.
+pub fn resolve_seed(flag: Option<u64>, cfg_seed: u64) -> u64 {
+    if let Some(s) = flag {
+        return s;
+    }
+    if cfg_seed != 0 {
+        return cfg_seed;
+    }
+    random_seed()
+}
+
+/// Nondeterministic seed from clock plus pid. No rand crate needed.
+pub fn random_seed() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64 ^ d.as_secs())
+        .unwrap_or(0x9E37_79B9_7F4A_7C15);
+    nanos ^ ((std::process::id() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+}
+
 /// Deterministic mock answer. Same input plus same sampler gives byte identical output.
 /// Used for repro test and for offline demo before real llama backend.
 /// Never emits code blocks or source citations: those only come from real
@@ -97,6 +121,16 @@ pub fn stream_mock_to_stdout(answer: &str, flush_ms: u64) -> anyhow::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn random_seed_varies_and_flag_pins() {
+        assert_eq!(super::resolve_seed(Some(7), 0), 7);
+        assert_eq!(super::resolve_seed(None, 9), 9);
+        let a = super::resolve_seed(None, 0);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let b = super::resolve_seed(None, 0);
+        assert_ne!(a, b, "default seed must not freeze sampling");
+    }
 
     #[test]
     fn deterministic_seed_is_byte_identical() {

@@ -7,10 +7,11 @@ First run opens minimal: hero ZAI block logo plus a bordered quick start card pl
 First Enter with a message flips to full: sessions tabs left, chat main, input, model bar. Empty views (/new-chat, /clear, empty /open) return to minimal.
 Content column is centered, max 124 wide with gutters on wide terminals.
 History is exact: the question persists the moment Enter is pressed, the answer persists when its stream finishes, and Ctrl+C mid stream saves the real visible prefix as stopped. Enter during a stream never drops text.
-Top line is a slim brand strip only. The model bar always sits below the chat column: model plus quant plus size plus effort plus ctx meter plus profile plus turn count plus session tag, model id truncated from the left. Compact form on narrow screens.
-Chat cards: YOU uses green marker with left gutter, ZAI uses cyan marker with left gutter, system uses muted divider. Every card header carries the turn time.
+Top line is a slim brand strip only. The model bar always sits below the chat column on two lines: line one carries the FULL GGUF file name from the registry, line two quant plus size plus effort plus ctx meter plus profile plus turn count plus session tag. Compact form on narrow screens.
+Chat cards: YOU uses green marker with left gutter, numbered per exchange, ZAI uses cyan marker with left gutter plus the answering model tag, system uses muted divider. Every card header carries the turn time. A scrollbar appears on the chat edge whenever scrolled up.
 History renders the last 20 turns with a labeled cut plus a legacy mock cleanup note when old stored turns contained early mock artifacts.
-Welcome: centered block font ZAI plus Welcome to Zai plus subtitle plus quick start. Shown on boot splash, minimal stage, and empty chat.
+Welcome: block font ZAI with a cyan to magenta gradient plus Welcome to Zai plus subtitle plus quick start. Shown on boot splash, minimal stage hero, and empty chat.
+Quick start card: bordered panel with type, /model, /insert, /history, /help plus the ready model line. Never a plain screen.
 Slash palette: type / to see all commands. Up and Down move selection. Tab or Enter applies the highlighted command. Esc dismisses.
 Commands: /help /new /new-chat /sessions /open /model /insert /add /manage /ollama /run /setting /effort /budget /compact /history /export /sources /clear /plain /quit.
 Behavior: /new-chat starts a fresh chat session. /clear clears the entire chat log view and restores the minimal stage. /history lists recent exchanges compactly.

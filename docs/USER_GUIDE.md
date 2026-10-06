@@ -149,5 +149,40 @@ size, ctx hint, and saved status. `inspect` reads one file deep: GGUF
 version, tensor count, metadata entries, architecture, quant, and the
 id plus ctx an insert would use.
 
+## Backend
+
+Real answers come from a local llama.cpp build, never the mock:
+
+```bash
+zai backend status
+zai backend setup
+zai ask "explain ownership in Rust" --session work
+zai chat
+```
+
+`setup` clones the pinned llama.cpp tag plus cmake configure plus
+compile (several minutes once), then shares the binary system wide when
+allowed. Every chat, REPL, and ask answer above the local brain runs on
+it with the model ctx, sampler, and timeout from config. Ctrl+C in the
+TUI stops a running generation and keeps the visible prefix. `doctor`
+reports the backend row alongside model and brain.
+
+## Server
+
+One persistent `llama-server` keeps weights loaded, so the first answer
+warms up once and every next answer lands in seconds instead of a full
+reload per question:
+
+```bash
+zai backend serve
+zai backend status
+zai backend stop
+```
+
+The server starts itself on the first GGUF answer when the binary
+exists, and `stop` kills it. The model bar shows a green dot while it
+is up. Answers served this way carry `· server` in the backend note,
+one shot runs carry `· cli`.
+
 GGUF files are local only: insert from disk, delete from cache, never download.
 Ollama models install and delete through the daemon.
