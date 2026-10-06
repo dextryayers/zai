@@ -25,7 +25,7 @@ dependencies = [
 
 [[package]]
 name = "aicli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "aicli-core",
  "aicli-infer",
@@ -109,11 +109,16 @@ dependencies = [
 
 [[package]]
 name = "aicli-tools"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aicli-ingest",
  "anyhow",
+ "chrono",
+ "rusqlite",
  "serde",
+ "serde_json",
+ "similar",
+ "tempfile",
 ]
 
 [[package]]

@@ -55,7 +55,7 @@ pub async fn run_chat(
         "{}",
         status::status_line(
             theme,
-            "0.3.0",
+            "0.4.0",
             &model_id,
             0,
             n_ctx,
@@ -271,7 +271,7 @@ async fn handle_slash(
                 aicli_ui::panel::render_panel(
                     theme,
                     "Commands",
-                    "/help /new [title] /sessions /open <id> /model [name] /ctx [n] /ctx compact\n/temp [x] /sources /budget /export [md|json] /plain /clear /quit\nKeys: Ctrl+C stop  Ctrl+D exit  Ctrl+L clear  Ctrl+R history"
+                    "/help /new [title] /sessions /open <id> /model [name] /ctx [n] /ctx compact\n/code <goal> /note <text> /note promote <turn> /memory /daily /budget /export [md|json]\n/temp [x] /sources /plain /clear /quit\nKeys: Ctrl+C stop  Ctrl+D exit  Ctrl+L clear  Ctrl+R history"
                 )
             );
             Ok(true)
@@ -361,6 +361,69 @@ async fn handle_slash(
             }
             Ok(true)
         }
+        ["/code", rest @ ..] => {
+            if rest.is_empty() {
+                println!(
+                    "{}",
+                    theme.muted("usage: /code <goal>  (dry-run plan plus diff preview)")
+                );
+                return Ok(true);
+            }
+            let goal = rest.join(" ");
+            println!(
+                "{}",
+                theme.muted(&format!("code goal: {goal}  (run outside REPL for full apply: aicli code \"{goal}\" --apply)"))
+            );
+            Ok(true)
+        }
+        ["/note", "promote", turn_id] => {
+            let turns = aicli_core::sessions::list_turns(conn, session_id).unwrap_or_default();
+            if let Some(t) = turns.iter().find(|t| t.id == *turn_id) {
+                let p = aicli_core::memory::memory_promote(
+                    &ctx.paths.data_dir,
+                    session_id,
+                    &t.id,
+                    &t.role,
+                    &t.content,
+                )?;
+                println!("{}", theme.ok(&format!("promoted to {p}")));
+            } else {
+                println!("{}", theme.warn(&format!("turn {turn_id} not found")));
+            }
+            Ok(true)
+        }
+        ["/note", rest @ ..] => {
+            if rest.is_empty() {
+                println!(
+                    "{}",
+                    theme.muted("usage: /note <text>  or  /note promote <turn-id>")
+                );
+                return Ok(true);
+            }
+            let text = rest.join(" ");
+            let n = aicli_core::store::note_add(&ctx.paths.data_dir, &text, None)?;
+            println!("{}", theme.ok(&format!("note {} saved", n.id)));
+            Ok(true)
+        }
+        ["/memory"] => {
+            let text = aicli_core::memory::memory_show(&ctx.paths.data_dir);
+            println!(
+                "{}",
+                aicli_ui::panel::render_panel(theme, "Memory", text.trim())
+            );
+            Ok(true)
+        }
+        ["/daily"] => {
+            let report = aicli_core::store::week_report(&ctx.paths.data_dir);
+            println!(
+                "{}",
+                theme.muted(&format!(
+                    "today open tasks plus week notes {} total, run: aicli daily --today",
+                    report.total_notes
+                ))
+            );
+            Ok(true)
+        }
         ["/plain"] => {
             println!(
                 "{}",
@@ -385,6 +448,7 @@ async fn handle_slash(
                 "/daily",
                 "/task",
                 "/note",
+                "/memory",
                 "/sources",
                 "/budget",
                 "/export",

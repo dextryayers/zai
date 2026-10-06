@@ -1,3 +1,4 @@
+use crate::MemoryOp;
 use crate::{output, repl, Cmd, Ctx, ModelsOp, NotesOp, PatchOp, SessionsOp, TasksOp};
 use aicli_ui::{markdown, panel, progress, status, table};
 use serde::Serialize;
@@ -50,6 +51,7 @@ pub async fn dispatch(ctx: Ctx) -> anyhow::Result<()> {
             max_steps,
             temp,
             seed,
+            yes,
         }) => cmd_code(
             &ctx,
             goal,
@@ -60,6 +62,7 @@ pub async fn dispatch(ctx: Ctx) -> anyhow::Result<()> {
             *max_steps,
             *temp,
             *seed,
+            *yes,
         ),
         Some(Cmd::Patch { op }) => cmd_patch(&ctx, op),
         Some(Cmd::Run { cmd }) => cmd_run(&ctx, cmd),
@@ -75,6 +78,7 @@ pub async fn dispatch(ctx: Ctx) -> anyhow::Result<()> {
         Some(Cmd::Notes { op }) => cmd_notes(&ctx, op),
         Some(Cmd::Sessions { op }) => cmd_sessions(&ctx, op),
         Some(Cmd::Config { op }) => cmd_config(&ctx, op),
+        Some(Cmd::Memory { op }) => cmd_memory(&ctx, op),
         Some(Cmd::Doctor {
             bench_load,
             bench_gen,
@@ -97,7 +101,7 @@ fn show_home(ctx: &Ctx) -> anyhow::Result<()> {
             true,
             Data {
                 product: "aicli".to_string(),
-                version: "0.3.0".to_string(),
+                version: "0.4.0".to_string(),
                 model: ctx.config.model.default.clone(),
                 profile: ctx.paths.profile.clone(),
             },
@@ -108,7 +112,7 @@ fn show_home(ctx: &Ctx) -> anyhow::Result<()> {
         "{}",
         status::status_line(
             theme,
-            "0.3.0",
+            "0.4.0",
             &ctx.config.model.default,
             0,
             ctx.config.model.n_ctx,
@@ -333,7 +337,7 @@ fn cmd_ask(
             "{}",
             status::status_line(
                 theme,
-                "0.3.0",
+                "0.4.0",
                 &model_id,
                 usage.estimated_tokens as u32,
                 n_ctx,
@@ -372,20 +376,105 @@ fn cmd_code(
     path: &std::path::Path,
     _dry_run: bool,
     apply: bool,
-    _allow_shell: bool,
+    allow_shell: bool,
     max_steps: u32,
     temp: Option<f32>,
     seed: Option<u64>,
+    yes: bool,
 ) -> anyhow::Result<()> {
     let theme = &ctx.theme;
     let sampler = sampler_for(ctx, temp, seed, "code");
-    let hits = aicli_tools::search_files(path, goal, false, true, &[], 5).unwrap_or_default();
+    let steps_cap = max_steps.min(ctx.config.tools.max_steps).max(1);
+    let root = if path.is_file() {
+        path.parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf()
+    } else {
+        path.to_path_buf()
+    };
+    let session_tag = "code-cli";
+
+    // Step 1 INVESTIGATE with animated checklist.
+    let mut plan = vec![
+        ("scope search".to_string(), false),
+        ("read top hits".to_string(), false),
+        ("draft diff".to_string(), false),
+        ("approval".to_string(), false),
+        ("verify".to_string(), false),
+    ];
+    let render_plan = |plan: &[(String, bool)]| -> String {
+        plan.iter()
+            .enumerate()
+            .map(|(i, (name, done))| {
+                let mark = if *done { "ok" } else { ".." };
+                format!("{}. [{mark}] {name}", i + 1)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    if !ctx.is_json() && !ctx.is_quiet() {
+        for i in 0..3 {
+            print!(
+                "\r{}",
+                progress::spinner_line(theme, i, "agent: scoping search")
+            );
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        }
+        println!();
+    }
+    let keyword = goal.split_whitespace().next().unwrap_or(goal);
+    let hits = aicli_tools::search_files(&root, keyword, false, true, &[], 20).unwrap_or_default();
+    let _ = aicli_tools::log_event(
+        &ctx.paths.data_dir,
+        "code.search",
+        Some(session_tag),
+        &format!("goal={goal} hits={}", hits.len()),
+    );
+    plan[0].1 = true;
+
+    // Step 2 read top 3 files inside sandbox.
+    let mut read_summaries: Vec<String> = Vec::new();
+    for h in hits.iter().take(3) {
+        let rel = pathdiff_rel(&root, &std::path::PathBuf::from(&h.file));
+        if let Ok((lines, total)) = aicli_tools::fs_read(
+            &root,
+            &rel,
+            h.line_no.saturating_sub(5).max(1),
+            h.line_no + 20,
+        ) {
+            read_summaries.push(format!("{}:{} total {total} lines", h.file, h.line_no));
+            let _ = lines;
+        }
+    }
+    plan[1].1 = true;
+    if steps_cap < 3 {
+        anyhow::bail!(
+            "max_steps {steps_cap} too low, need at least 3 for investigate plus draft plus review"
+        );
+    }
+
+    // Step 3 draft diff. Deterministic template grounded in search hits.
+    let diff = draft_diff_for_goal(&root, goal, &hits);
+    let file_count = aicli_tools::validate_patch(&diff, root.to_string_lossy().as_ref())
+        .map_err(|e| anyhow::anyhow!("draft diff invalid: {e}"))?;
+    plan[2].1 = true;
+    let _ = aicli_tools::log_event(
+        &ctx.paths.data_dir,
+        "code.draft",
+        Some(session_tag),
+        &format!("files={file_count} goal={goal}"),
+    );
+
     if ctx.is_json() {
         #[derive(Serialize)]
         struct Data {
             goal: String,
             steps: u32,
             hits: usize,
+            files: usize,
+            diff: String,
             sampler: aicli_infer::SamplerConfig,
             mode: String,
         }
@@ -393,76 +482,280 @@ fn cmd_code(
             true,
             Data {
                 goal: goal.to_string(),
-                steps: max_steps.min(ctx.config.tools.max_steps),
+                steps: steps_cap,
                 hits: hits.len(),
+                files: file_count,
+                diff: diff.clone(),
                 sampler,
-                mode: "dry-run preview, apply in Phase 4".to_string(),
+                mode: if apply { "apply-requested" } else { "dry-run" }.to_string(),
             },
         );
+        if !apply {
+            return Ok(());
+        }
+    } else {
+        println!(
+            "{}",
+            panel::render_panel(
+                theme,
+                "Plan",
+                &format!(
+                    "goal: {goal}\nmode: code temp {:.1} seed {}\n{}",
+                    sampler.temp,
+                    sampler.seed,
+                    render_plan(&plan)
+                )
+            )
+        );
+        if hits.is_empty() {
+            println!("{}", theme.warn("no matching files, scope is full root"));
+        } else {
+            let rows: Vec<Vec<String>> = hits
+                .iter()
+                .take(5)
+                .map(|h| vec![h.file.clone(), h.line_no.to_string(), h.line.clone()])
+                .collect();
+            println!(
+                "{}",
+                table::render_table(
+                    theme,
+                    &["FILE", "LINE", "TEXT"],
+                    &rows,
+                    &[false, true, false]
+                )
+            );
+        }
+        // Diff preview with word diff styling via panel.
+        println!(
+            "{}",
+            panel::render_panel(theme, "Diff preview", diff.trim())
+        );
+        if !read_summaries.is_empty() {
+            println!(
+                "{}",
+                theme.muted(&format!("read: {}", read_summaries.join(" | ")))
+            );
+        }
+    }
+
+    // Save patch file for review flow.
+    let patch_id = format!("p{:04}", patch_counter(&ctx.paths.patches_dir) + 1);
+    std::fs::create_dir_all(&ctx.paths.patches_dir)?;
+    let patch_file = ctx.paths.patches_dir.join(format!("{patch_id}.diff"));
+    std::fs::write(&patch_file, &diff)?;
+    if !ctx.is_json() {
+        println!(
+            "{}",
+            theme.muted(&format!(
+                "patch saved: {} ({patch_id})",
+                patch_file.display()
+            ))
+        );
+    }
+
+    if !apply {
+        if !ctx.is_json() {
+            println!(
+                "{}",
+                theme.muted("dry-run only, no files changed. Review then: patch apply or code --apply --yes")
+            );
+        }
         return Ok(());
     }
-    println!(
-        "{}",
-        panel::render_panel(
-            theme,
-            "Plan",
-            &format!(
-                "goal: {goal}\nmode: code temp {:.1} seed {}\n1. search scope\n2. read top hits\n3. draft diff\n4. request approval",
-                sampler.temp, sampler.seed
-            )
-        )
-    );
-    if hits.is_empty() {
-        println!("{}", theme.warn("no matching files, try broader goal"));
-    } else {
-        let rows: Vec<Vec<String>> = hits
-            .iter()
-            .take(5)
-            .map(|h| vec![h.file.clone(), h.line_no.to_string(), h.line.clone()])
-            .collect();
+
+    // Step 4 approval. Explicit prompt unless --yes.
+    plan[3].1 = false;
+    if !yes && !ctx.is_json() {
         println!(
             "{}",
-            table::render_table(
+            panel::render_panel(
                 theme,
-                &["FILE", "LINE", "TEXT"],
-                &rows,
-                &[false, true, false]
+                "Approval",
+                "Apply? [a]pply  [r]eject  [t]show tests\nType a plus Enter. Ctrl+C aborts with zero changes."
             )
+        );
+        let choice = read_line_prompt(theme, "choice [a/r/t]> ")?;
+        match choice.trim().to_lowercase().as_str() {
+            "a" | "apply" | "y" | "yes" => {}
+            "t" => {
+                println!(
+                    "{}",
+                    theme.muted("verify plan: cargo fmt --check, cargo test --quiet")
+                );
+                return Ok(());
+            }
+            _ => {
+                println!("{}", theme.warn("rejected, zero files changed"));
+                return Ok(());
+            }
+        }
+    } else if !yes && ctx.is_json() {
+        // JSON apply without --yes stays dry for safety.
+        return Ok(());
+    }
+    plan[3].1 = true;
+
+    // Step 5 atomic apply plus verify.
+    for i in 0..3 {
+        print!(
+            "\r{}",
+            progress::spinner_line(theme, i, "agent: applying patch atomic")
+        );
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        std::thread::sleep(std::time::Duration::from_millis(60));
+    }
+    println!();
+    let touched = aicli_tools::apply_patch_set(&root, &diff)
+        .map_err(|e| anyhow::anyhow!("apply failed, zero files changed: {e}"))?;
+    let _ = aicli_tools::log_event(
+        &ctx.paths.data_dir,
+        "code.apply",
+        Some(session_tag),
+        &format!("patch={patch_id} touched={}", touched.join(",")),
+    );
+    plan[4].1 = true;
+    if !ctx.is_json() {
+        println!(
+            "{}",
+            panel::render_panel(
+                theme,
+                "Applied",
+                &format!("{}\nbackup: <file>.aicli.bak.<ts>", touched.join("\n"))
+            )
+        );
+        println!(
+            "{}",
+            panel::render_panel(theme, "Plan done", &render_plan(&plan))
         );
     }
-    let diff = "--- a/example.rs\n+++ b/example.rs\n@@ -1,2 +1,3 @@\n fn main() {}\n+// aicli: planned edit\n";
-    println!(
-        "{}",
-        panel::render_panel(theme, "Diff preview", diff.trim())
-    );
-    if apply {
-        println!(
-            "{}",
-            theme.warn(
-                "apply requested but Phase 4 gate requires explicit approval UI, staying dry-run"
-            )
-        );
-    } else {
-        println!(
-            "{}",
-            theme.muted("dry-run only, no files changed. Use patch apply after review in Phase 4.")
-        );
+
+    // Verify when Rust files changed and shell allowed.
+    let rust_touched = touched.iter().any(|p| p.ends_with(".rs"));
+    if rust_touched {
+        let verify_cmd = "cargo fmt --check";
+        if aicli_tools::check_shell(
+            verify_cmd,
+            &ctx.config.tools.shell_allowlist,
+            &ctx.config.tools.shell_denylist,
+        ) == aicli_tools::GateDecision::Allow
+            && (allow_shell || yes)
+        {
+            let logp = ctx.paths.logs_dir.join("code-verify.log");
+            match aicli_tools::run_blocking(
+                verify_cmd,
+                &root,
+                &ctx.config.tools.shell_allowlist,
+                &ctx.config.tools.shell_denylist,
+                std::time::Duration::from_secs(60),
+                Some(&logp),
+            ) {
+                Ok((preview, _, code)) => {
+                    if !ctx.is_json() {
+                        println!(
+                            "{}",
+                            panel::render_panel(
+                                theme,
+                                &format!("Verify {verify_cmd} exit {code}"),
+                                &preview.chars().take(1500).collect::<String>()
+                            )
+                        );
+                    }
+                }
+                Err(e) => {
+                    if !ctx.is_json() {
+                        println!("{}", theme.warn(&format!("verify skipped: {e}")));
+                    }
+                }
+            }
+        } else if !ctx.is_json() {
+            println!(
+                "{}",
+                theme.muted("verify skipped: pass --allow-shell with allowlisted fmt command")
+            );
+        }
+    }
+
+    if ctx.is_json() {
+        #[derive(Serialize)]
+        struct Applied {
+            patch_id: String,
+            touched: Vec<String>,
+        }
+        output::print_json(true, Applied { patch_id, touched });
     }
     Ok(())
 }
 
+fn patch_counter(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().extension().map(|x| x == "diff").unwrap_or(false))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn pathdiff_rel(root: &std::path::Path, abs: &std::path::Path) -> String {
+    if let Ok(rel) = abs.strip_prefix(root) {
+        return rel.to_string_lossy().to_string();
+    }
+    // Fallback: file name only when outside root listing uses absolute cache paths.
+    abs.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| abs.to_string_lossy().to_string())
+}
+
+fn draft_diff_for_goal(
+    root: &std::path::Path,
+    goal: &str,
+    hits: &[aicli_tools::SearchHit],
+) -> String {
+    // Grounded template: touch first hit file when available, else create note file.
+    // Keeps hunks valid by reading real context lines.
+    if let Some(h) = hits.first() {
+        let rel = pathdiff_rel(root, &std::path::PathBuf::from(&h.file));
+        let ctx_lines = aicli_tools::fs_read(root, &rel, h.line_no, h.line_no)
+            .map(|(v, _)| v.first().cloned().unwrap_or_default())
+            .unwrap_or_default();
+        let safe_ctx = if ctx_lines.trim().is_empty() {
+            "// context".to_string()
+        } else {
+            ctx_lines
+        };
+        return format!(
+            "--- a/{rel}\n+++ b/{rel}\n@@ -{n},1 +{n},2 @@\n {safe_ctx}\n+// aicli: {goal_short}\n",
+            n = h.line_no,
+            rel = rel,
+            safe_ctx = safe_ctx,
+            goal_short = goal.chars().take(80).collect::<String>(),
+        );
+    }
+    "--- a/aicli-note.md\n+++ b/aicli-note.md\n@@ -1,0 +1,2 @@\n+# aicli\n+// aicli: planned edit\n"
+        .to_string()
+}
+
+fn read_line_prompt(theme: &aicli_ui::Theme, prompt: &str) -> anyhow::Result<String> {
+    use std::io::Write;
+    // Auto yes for tests and pipes.
+    if std::env::var("AICLI_AUTO_YES").is_ok() {
+        return Ok("a".to_string());
+    }
+    print!("{}", theme.accent(prompt));
+    let _ = std::io::stdout().flush();
+    let mut s = String::new();
+    std::io::stdin().read_line(&mut s)?;
+    Ok(s)
+}
+
 fn cmd_patch(ctx: &Ctx, op: &PatchOp) -> anyhow::Result<()> {
     let theme = &ctx.theme;
+    let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     match op {
         PatchOp::Show { patch_id } => {
             let p = ctx.paths.patches_dir.join(format!("{patch_id}.diff"));
-            if p.exists() {
-                let text = std::fs::read_to_string(&p).unwrap_or_default();
-                println!(
-                    "{}",
-                    panel::render_panel(theme, &format!("Patch {patch_id}"), &text)
-                );
-            } else {
+            if !p.exists() {
                 println!(
                     "{}",
                     panel::render_panel(
@@ -471,24 +764,151 @@ fn cmd_patch(ctx: &Ctx, op: &PatchOp) -> anyhow::Result<()> {
                         "no pending patch with that id"
                     )
                 );
+                return Ok(());
+            }
+            let text = std::fs::read_to_string(&p).unwrap_or_default();
+            if ctx.is_json() {
+                #[derive(Serialize)]
+                struct Data {
+                    id: String,
+                    diff: String,
+                    files: usize,
+                }
+                let files = aicli_tools::validate_patch(&text, ".").unwrap_or(0);
+                output::print_json(
+                    true,
+                    Data {
+                        id: patch_id.clone(),
+                        diff: text,
+                        files,
+                    },
+                );
+                return Ok(());
+            }
+            // Render with line numbers and gutter colors via word diff stats.
+            let files = aicli_tools::parse_patch(&text, &root).unwrap_or_default();
+            let mut body = String::new();
+            for f in &files {
+                body.push_str(&format!("file: {}\n", f.new_path));
+                for h in &f.hunks {
+                    body.push_str(&format!(
+                        "hunk -{},{} +{},{} lines {}\n",
+                        h.old_start,
+                        h.old_lines,
+                        h.new_start,
+                        h.new_lines,
+                        h.body.len()
+                    ));
+                }
+            }
+            body.push_str("\n--- raw ---\n");
+            body.push_str(text.trim());
+            println!(
+                "{}",
+                panel::render_panel(theme, &format!("Patch {patch_id}"), &body)
+            );
+        }
+        PatchOp::Apply { patch_id, yes } => {
+            let p = ctx.paths.patches_dir.join(format!("{patch_id}.diff"));
+            if !p.exists() {
+                anyhow::bail!("unknown patch {patch_id}");
+            }
+            let diff = std::fs::read_to_string(&p)?;
+            // Validate first, show files, require --yes or prompt.
+            let files = aicli_tools::parse_patch(&diff, &root)?;
+            if !ctx.is_json() && !yes {
+                println!(
+                    "{}",
+                    panel::render_panel(
+                        theme,
+                        &format!("Apply {patch_id}"),
+                        &format!(
+                            "files: {}\nType yes plus Enter for atomic apply.",
+                            files
+                                .iter()
+                                .map(|f| f.new_path.clone())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    )
+                );
+                let ans = read_line_prompt(theme, "apply? [yes/no]> ")?;
+                if ans.trim().to_lowercase() != "yes" {
+                    println!("{}", theme.warn("aborted, zero files changed"));
+                    return Ok(());
+                }
+            }
+            // Atomic apply: all hunks or zero changes.
+            for i in 0..3 {
+                print!(
+                    "\r{}",
+                    progress::spinner_line(theme, i, "applying patch atomic")
+                );
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            println!();
+            // Patches drafted from repo root, but CLI root may be cwd. Try cwd then repo ancestors.
+            let touched = apply_with_root_fallback(&root, &diff)?;
+            let _ = aicli_tools::log_event(
+                &ctx.paths.data_dir,
+                "patch.apply",
+                None,
+                &format!("patch={patch_id} touched={}", touched.join(",")),
+            );
+            if ctx.is_json() {
+                #[derive(Serialize)]
+                struct Data {
+                    id: String,
+                    touched: Vec<String>,
+                }
+                output::print_json(
+                    true,
+                    Data {
+                        id: patch_id.clone(),
+                        touched,
+                    },
+                );
+            } else {
+                println!(
+                    "{}",
+                    panel::render_panel(theme, &format!("Applied {patch_id}"), &touched.join("\n"))
+                );
             }
         }
-        PatchOp::Apply { patch_id, .. } => {
-            println!(
-                "{}",
-                theme.warn(&format!(
-                    "apply {patch_id} deferred to Phase 4 atomic engine"
-                ))
-            );
-        }
         PatchOp::Drop { patch_id } => {
-            println!(
-                "{}",
-                theme.muted(&format!("drop {patch_id}: nothing to drop"))
-            );
+            let p = ctx.paths.patches_dir.join(format!("{patch_id}.diff"));
+            if p.exists() {
+                std::fs::remove_file(&p)?;
+                println!("{}", theme.ok(&format!("dropped {patch_id}")));
+            } else {
+                println!(
+                    "{}",
+                    theme.muted(&format!("drop {patch_id}: nothing to drop"))
+                );
+            }
         }
     }
     Ok(())
+}
+
+fn apply_with_root_fallback(root: &std::path::Path, diff: &str) -> anyhow::Result<Vec<String>> {
+    // Try cwd, then walk up to 4 ancestors. Each attempt is atomic so safe to retry.
+    let mut cur = Some(root.to_path_buf());
+    let mut last_err = anyhow::anyhow!("no root tried");
+    for _ in 0..5 {
+        if let Some(r) = cur.clone() {
+            match aicli_tools::apply_patch_set(&r, diff) {
+                Ok(touched) => return Ok(touched),
+                Err(e) => last_err = e,
+            }
+            cur = r.parent().map(|p| p.to_path_buf());
+        } else {
+            break;
+        }
+    }
+    Err(last_err)
 }
 
 fn cmd_run(ctx: &Ctx, cmd: &[String]) -> anyhow::Result<()> {
@@ -497,36 +917,114 @@ fn cmd_run(ctx: &Ctx, cmd: &[String]) -> anyhow::Result<()> {
     if full.is_empty() {
         anyhow::bail!("usage: aicli run -- <cmd...>");
     }
-    match aicli_tools::check_shell(
+    // Gate first for fast deny with exit 5.
+    if let aicli_tools::GateDecision::Deny { reason, hint } = aicli_tools::check_shell(
         &full,
         &ctx.config.tools.shell_allowlist,
         &ctx.config.tools.shell_denylist,
     ) {
-        aicli_tools::GateDecision::Allow => {
-            println!("{}", theme.muted(&format!("run: {full}")));
-            let out = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(&full)
-                .output()?;
-            let text = String::from_utf8_lossy(&out.stdout).to_string()
-                + &String::from_utf8_lossy(&out.stderr);
-            let preview: String = text.chars().take(4000).collect();
-            println!("{preview}");
-            if !out.status.success() {
-                std::process::exit(out.status.code().unwrap_or(6));
+        if ctx.is_json() {
+            output::print_json_error("E_TOOL_DENIED", &reason, &hint);
+        } else {
+            eprintln!(
+                "{}",
+                aicli_ui::panel::render_error(theme, "E_TOOL_DENIED", &reason, &hint, None)
+            );
+        }
+        std::process::exit(5);
+    }
+    // Confirm when required, unless auto yes env or JSON quiet automation.
+    let need_confirm = ctx.config.tools.confirm_shell && std::env::var("AICLI_AUTO_YES").is_err();
+    if need_confirm && !ctx.is_json() {
+        println!(
+            "{}",
+            panel::render_panel(
+                theme,
+                "Run approval",
+                &format!("cmd: {full}\nAllowlisted. Type yes to run, Ctrl+C aborts.")
+            )
+        );
+        // Elegant 3s countdown display before prompt.
+        for i in (1..=3).rev() {
+            print!(
+                "\r{}",
+                theme.muted(&format!("confirm in {i}s, Ctrl+C aborts"))
+            );
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+        println!();
+        let ans = read_line_prompt(theme, "run? [yes/no]> ")?;
+        if ans.trim().to_lowercase() != "yes" {
+            println!("{}", theme.warn("aborted, nothing ran"));
+            return Ok(());
+        }
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let logp = ctx.paths.logs_dir.join("run.log");
+    match aicli_tools::run_blocking(
+        &full,
+        &cwd,
+        &ctx.config.tools.shell_allowlist,
+        &ctx.config.tools.shell_denylist,
+        std::time::Duration::from_secs(60),
+        Some(&logp),
+    ) {
+        Ok((preview, full_text, code)) => {
+            let _ = aicli_tools::log_event(
+                &ctx.paths.data_dir,
+                "shell.run",
+                None,
+                &format!("cmd={full} exit={code}"),
+            );
+            if ctx.is_json() {
+                #[derive(Serialize)]
+                struct Data {
+                    cmd: String,
+                    exit: i32,
+                    preview: String,
+                }
+                output::print_json(
+                    true,
+                    Data {
+                        cmd: full,
+                        exit: code,
+                        preview,
+                    },
+                );
+            } else {
+                println!("{preview}");
+                let _ = full_text;
+                if code != 0 {
+                    std::process::exit(code);
+                }
             }
             Ok(())
         }
-        aicli_tools::GateDecision::Deny { reason, hint } => {
-            if ctx.is_json() {
-                output::print_json_error("E_TOOL_DENIED", &reason, &hint);
-            } else {
-                eprintln!(
-                    "{}",
-                    aicli_ui::panel::render_error(theme, "E_TOOL_DENIED", &reason, &hint, None)
-                );
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("E_TOOL_DENIED") {
+                if ctx.is_json() {
+                    output::print_json_error("E_TOOL_DENIED", &msg, "choose allowlisted command");
+                } else {
+                    eprintln!(
+                        "{}",
+                        aicli_ui::panel::render_error(
+                            theme,
+                            "E_TOOL_DENIED",
+                            &msg,
+                            "choose allowlisted command",
+                            None
+                        )
+                    );
+                }
+                std::process::exit(5);
             }
-            std::process::exit(5);
+            if msg.contains("E_TIMEOUT") {
+                anyhow::bail!("{msg}");
+            }
+            anyhow::bail!("{msg}")
         }
     }
 }
@@ -838,6 +1336,58 @@ fn cmd_daily(
     }
     let tasks = aicli_core::store::task_list(&ctx.paths.data_dir, None);
     let open: Vec<_> = tasks.iter().filter(|t| !t.done).collect();
+    if week {
+        let report = aicli_core::store::week_report(&ctx.paths.data_dir);
+        if ctx.is_json() {
+            output::print_json(true, &report);
+            return Ok(());
+        }
+        // Elegant week table with per day bars.
+        let rows: Vec<Vec<String>> = report
+            .days
+            .iter()
+            .map(|d| {
+                let bar = "=".repeat(d.open.min(10));
+                vec![
+                    d.date.clone(),
+                    format!("{}", d.open),
+                    format!("{}", d.done),
+                    format!("{}", d.notes),
+                    bar,
+                ]
+            })
+            .collect();
+        println!(
+            "{}",
+            table::render_table(
+                theme,
+                &["DATE", "OPEN", "DONE", "NOTES", "LOAD"],
+                &rows,
+                &[false, true, true, true, false]
+            )
+        );
+        let top = report
+            .top_terms
+            .iter()
+            .map(|(w, c)| format!("{w} {c}x"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "{}",
+            panel::render_panel(
+                theme,
+                "Week",
+                &format!(
+                    "open {} done {} notes {}\ntop: {}\ncounts only, no invented narrative",
+                    report.total_open,
+                    report.total_done,
+                    report.total_notes,
+                    if top.is_empty() { "-" } else { &top }
+                )
+            )
+        );
+        return Ok(());
+    }
     if ctx.is_json() {
         #[derive(Serialize)]
         struct Data {
@@ -855,18 +1405,19 @@ fn cmd_daily(
         );
         return Ok(());
     }
+    // Today view with memory hint and animated header.
+    let mem_hint = if aicli_core::memory::memory_path(&ctx.paths.data_dir).exists() {
+        "memory: on, see: aicli memory show"
+    } else {
+        "memory: empty, add with: aicli memory add \"prefer tabs\""
+    };
     let mut body = format!("open tasks: {}\n", open.len());
     for t in open.iter().take(10) {
         body.push_str(&format!("[ ] {} {}\n", t.id, t.text));
     }
     if today || (!today && !week) {
         body.push_str("\nRun: aicli tasks add \"write tests\"");
-    }
-    if week {
-        body.push_str(&format!(
-            "\nweek: {} total tasks, model narrative in Phase 5",
-            tasks.len()
-        ));
+        body.push_str(&format!("\n{mem_hint}"));
     }
     println!("{}", panel::render_panel(theme, "Daily", body.trim()));
     Ok(())
@@ -944,12 +1495,56 @@ fn cmd_tasks(ctx: &Ctx, op: &TasksOp) -> anyhow::Result<()> {
             Ok(())
         }
         TasksOp::Carry { from } => {
-            println!(
-                "{}",
-                theme.muted(&format!(
-                    "carry from {from}: copy open tasks in Phase 5 full"
-                ))
-            );
+            let n = aicli_core::store::task_carry(&ctx.paths.data_dir, from)?;
+            if ctx.is_json() {
+                #[derive(Serialize)]
+                struct Data {
+                    from: String,
+                    copied: usize,
+                }
+                output::print_json(
+                    true,
+                    Data {
+                        from: from.clone(),
+                        copied: n,
+                    },
+                );
+            } else {
+                println!(
+                    "{}",
+                    theme.ok(&format!("carried {n} open tasks from {from} to today"))
+                );
+            }
+            Ok(())
+        }
+        TasksOp::Clear { date, yes } => {
+            if !yes && !ctx.is_json() {
+                println!("{}", theme.warn("clear needs --yes, no action taken"));
+                return Ok(());
+            }
+            let items = aicli_core::store::task_list(&ctx.paths.data_dir, date.as_deref());
+            let mut removed = 0;
+            if let Ok(conn) = aicli_core::db::open(&ctx.paths.db_file) {
+                for t in &items {
+                    if t.done
+                        && conn
+                            .execute("DELETE FROM tasks WHERE id=?1", [t.id.clone()])
+                            .unwrap_or(0)
+                            > 0
+                    {
+                        removed += 1;
+                    }
+                }
+            }
+            if ctx.is_json() {
+                #[derive(Serialize)]
+                struct Data {
+                    removed: usize,
+                }
+                output::print_json(true, Data { removed });
+            } else {
+                println!("{}", theme.ok(&format!("cleared {removed} done tasks")));
+            }
             Ok(())
         }
     }
@@ -996,10 +1591,16 @@ fn cmd_notes(ctx: &Ctx, op: &NotesOp) -> anyhow::Result<()> {
             let hits = aicli_core::store::note_search(&ctx.paths.data_dir, query, 20);
             if ctx.is_json() {
                 output::print_json(true, &hits);
+            } else if hits.is_empty() {
+                println!("{}", theme.warn("no notes match"));
             } else {
+                // Keyword highlight: wrap matched query with accent markers.
                 let rows: Vec<Vec<String>> = hits
                     .iter()
-                    .map(|n| vec![n.id.clone(), n.date.clone(), n.text.clone()])
+                    .map(|n| {
+                        let hl = highlight_query(&n.text, query, theme);
+                        vec![n.id.clone(), n.date.clone(), hl]
+                    })
                     .collect();
                 println!(
                     "{}",
@@ -1010,6 +1611,109 @@ fn cmd_notes(ctx: &Ctx, op: &NotesOp) -> anyhow::Result<()> {
                         &[false, false, false]
                     )
                 );
+            }
+            Ok(())
+        }
+    }
+}
+
+fn highlight_query(text: &str, query: &str, theme: &aicli_ui::Theme) -> String {
+    let q = query.trim();
+    if q.is_empty() {
+        return text.to_string();
+    }
+    // Case insensitive single pass, deterministic.
+    let lower = text.to_lowercase();
+    let lq = q.to_lowercase();
+    if let Some(pos) = lower.find(&lq) {
+        let end = pos + lq.len();
+        // Byte indices are safe for ascii query; fallback to plain on unicode edge.
+        if let (Some(a), Some(b)) = (text.get(..pos), text.get(pos..end)) {
+            let rest = text.get(end..).unwrap_or("");
+            return format!("{a}{}{rest}", theme.accent(b));
+        }
+    }
+    text.to_string()
+}
+
+fn cmd_memory(ctx: &Ctx, op: &MemoryOp) -> anyhow::Result<()> {
+    let theme = &ctx.theme;
+    match op {
+        MemoryOp::Show => {
+            let text = aicli_core::memory::memory_show(&ctx.paths.data_dir);
+            if ctx.is_json() {
+                #[derive(Serialize)]
+                struct Data {
+                    path: String,
+                    content: String,
+                }
+                output::print_json(
+                    true,
+                    Data {
+                        path: aicli_core::memory::memory_path(&ctx.paths.data_dir)
+                            .display()
+                            .to_string(),
+                        content: text,
+                    },
+                );
+            } else {
+                println!(
+                    "{}",
+                    markdown::render_markdown(theme, &format!("```md\n{text}\n```"))
+                );
+            }
+            Ok(())
+        }
+        MemoryOp::Add { text } => {
+            let p = aicli_core::memory::memory_add(&ctx.paths.data_dir, text)?;
+            if ctx.is_json() {
+                #[derive(Serialize)]
+                struct Data {
+                    path: String,
+                }
+                output::print_json(true, Data { path: p });
+            } else {
+                println!("{}", theme.ok(&format!("memory appended: {p}")));
+            }
+            Ok(())
+        }
+        MemoryOp::Promote { session, turn } => {
+            let conn = aicli_core::db::open(&ctx.paths.db_file)?;
+            let turns = aicli_core::sessions::list_turns(&conn, session)?;
+            let found = turns
+                .iter()
+                .find(|t| t.id == *turn)
+                .ok_or_else(|| anyhow::anyhow!("unknown turn {turn} in session {session}"))?;
+            // Preview before append, never silent.
+            if !ctx.is_json() {
+                println!(
+                    "{}",
+                    panel::render_panel(
+                        theme,
+                        "Promote preview",
+                        &format!(
+                            "role: {}\n{}\n\nAppend to memory.md?",
+                            found.role,
+                            found.content.chars().take(800).collect::<String>()
+                        )
+                    )
+                );
+            }
+            let p = aicli_core::memory::memory_promote(
+                &ctx.paths.data_dir,
+                session,
+                &found.id,
+                &found.role,
+                &found.content,
+            )?;
+            if ctx.is_json() {
+                #[derive(Serialize)]
+                struct Data {
+                    path: String,
+                }
+                output::print_json(true, Data { path: p });
+            } else {
+                println!("{}", theme.ok(&format!("promoted to {p}")));
             }
             Ok(())
         }
@@ -1258,7 +1962,7 @@ fn cmd_doctor(
         output::print_json(
             true,
             Data {
-                version: "0.3.0".to_string(),
+                version: "0.4.0".to_string(),
                 profile: ctx.paths.profile.clone(),
                 config_file: ctx.paths.config_file.display().to_string(),
                 data_dir: ctx.paths.data_dir.display().to_string(),

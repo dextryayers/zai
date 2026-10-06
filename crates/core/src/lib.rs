@@ -1,5 +1,6 @@
 pub mod config;
 pub mod db;
+pub mod memory;
 pub mod paths;
 pub mod sessions;
 pub mod store;

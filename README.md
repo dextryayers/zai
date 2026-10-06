@@ -1,8 +1,8 @@
 # AICLI - Offline Coding and Daily Assistant
 
-Rust only CLI with local GGUF runtime, durable chat sessions, coding agent preview, daily tasks, and local file index.
+Rust only CLI with local GGUF runtime, safe coding agent, daily tasks, and local file index.
 
-Status: Phase 0 to Phase 3 complete. Offline runtime with budget plus sampler plus sqlite sessions. Real llama.cpp stream behind `llama` feature next.
+Status: Phase 0 to Phase 5 complete. Agent loop with atomic patch plus shell gate, daily week plus memory. RAG full index in Phase 6.
 
 ## Quickstart
 

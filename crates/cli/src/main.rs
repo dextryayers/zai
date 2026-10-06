@@ -85,6 +85,8 @@ pub enum Cmd {
         temp: Option<f32>,
         #[arg(long)]
         seed: Option<u64>,
+        #[arg(long, default_value_t = false)]
+        yes: bool,
     },
     /// Inspect pending patches
     Patch {
@@ -137,6 +139,11 @@ pub enum Cmd {
     Config {
         #[command(subcommand)]
         op: ConfigOp,
+    },
+    /// User owned long memory
+    Memory {
+        #[command(subcommand)]
+        op: MemoryOp,
     },
     /// Diagnostics and benchmarks
     Doctor {
@@ -194,6 +201,12 @@ pub enum TasksOp {
         #[arg(long, default_value = "yesterday")]
         from: String,
     },
+    Clear {
+        #[arg(long)]
+        date: Option<String>,
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -248,6 +261,13 @@ pub enum ConfigOp {
         #[arg(long, default_value_t = false)]
         yes: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MemoryOp {
+    Show,
+    Add { text: String },
+    Promote { session: String, turn: String },
 }
 
 pub struct Ctx {

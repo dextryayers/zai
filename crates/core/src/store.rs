@@ -107,6 +107,101 @@ pub fn task_done(data_dir: &Path, id: &str) -> Result<bool> {
     Ok(n > 0)
 }
 
+/// Carry open tasks from `from` date to today with new ids. Returns copied count.
+pub fn task_carry(data_dir: &Path, from: &str) -> Result<usize> {
+    let from_date = if from == "yesterday" {
+        yesterday()
+    } else {
+        from.to_string()
+    };
+    let open = task_list(data_dir, Some(&from_date))
+        .into_iter()
+        .filter(|t| !t.done)
+        .collect::<Vec<_>>();
+    let mut n = 0;
+    for t in open {
+        task_add(data_dir, &t.text, None)?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+fn yesterday() -> String {
+    let now = chrono::Utc::now() - chrono::Duration::days(1);
+    now.format("%Y-%m-%d").to_string()
+}
+
+/// Week aggregation: per day open plus done plus notes, plus top terms.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WeekDay {
+    pub date: String,
+    pub open: usize,
+    pub done: usize,
+    pub notes: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WeekReport {
+    pub days: Vec<WeekDay>,
+    pub total_open: usize,
+    pub total_done: usize,
+    pub total_notes: usize,
+    pub top_terms: Vec<(String, usize)>,
+}
+
+pub fn week_report(data_dir: &Path) -> WeekReport {
+    let today_s = today();
+    let mut days = Vec::new();
+    let mut total_open = 0;
+    let mut total_done = 0;
+    let mut total_notes = 0;
+    let mut freq: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for back in (0..7).rev() {
+        let d = (chrono::Utc::now() - chrono::Duration::days(back))
+            .format("%Y-%m-%d")
+            .to_string();
+        let tasks = task_list(data_dir, Some(&d));
+        let open = tasks.iter().filter(|t| !t.done).count();
+        let done = tasks.iter().filter(|t| t.done).count();
+        let notes = note_search(data_dir, "", 1000)
+            .into_iter()
+            .filter(|n| n.date == d)
+            .collect::<Vec<_>>();
+        for n in &notes {
+            for w in n.text.split_whitespace().take(20) {
+                let clean: String = w
+                    .to_lowercase()
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric())
+                    .collect();
+                if clean.len() >= 4 {
+                    *freq.entry(clean).or_insert(0) += 1;
+                }
+            }
+        }
+        total_open += open;
+        total_done += done;
+        total_notes += notes.len();
+        days.push(WeekDay {
+            date: d,
+            open,
+            done,
+            notes: notes.len(),
+        });
+    }
+    let mut top: Vec<(String, usize)> = freq.into_iter().collect();
+    top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    top.truncate(5);
+    let _ = today_s;
+    WeekReport {
+        days,
+        total_open,
+        total_done,
+        total_notes,
+        top_terms: top,
+    }
+}
+
 pub fn note_add(data_dir: &Path, text: &str, date: Option<&str>) -> Result<NoteItem> {
     let conn = open_and_migrate(data_dir)?;
     let id = next_id(&conn, "notes", "n")?;
