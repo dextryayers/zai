@@ -31,7 +31,11 @@ pub fn compose_answer(
         };
         match aicli_models::ollama::generate(omodel, prompt, ctx.config.model.timeout_s) {
             Ok(text) => {
-                return Answer { text, brain: None, backend_note: note };
+                return Answer {
+                    text,
+                    brain: None,
+                    backend_note: note,
+                };
             }
             Err(e) => {
                 return Answer {

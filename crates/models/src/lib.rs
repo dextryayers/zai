@@ -4,6 +4,19 @@ use std::path::{Path, PathBuf};
 
 pub mod ollama;
 
+/// Run blocking HTTP work on a dedicated OS thread.
+/// reqwest blocking creates its own runtime, which panics when dropped
+/// inside a Tokio context, so it must never run on an async worker.
+fn block<T, F>(f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    std::thread::spawn(f)
+        .join()
+        .map_err(|_| anyhow::anyhow!("background http thread failed"))?
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelEntry {
     pub id: String,
@@ -278,7 +291,14 @@ pub fn verify_sha256(path: &Path, expected: Option<&str>) -> Result<bool> {
 
 /// Download with resume via HTTP Range and elegant indicatif bar.
 /// Writes to dest.part then renames on complete verify.
+/// Runs on a dedicated thread, see block().
 pub fn download_with_resume(url: &str, dest: &Path) -> Result<()> {
+    let url = url.to_string();
+    let dest = dest.to_path_buf();
+    block(move || download_inner(&url, &dest))
+}
+
+fn download_inner(url: &str, dest: &Path) -> Result<()> {
     let part = dest.with_extension("part");
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;

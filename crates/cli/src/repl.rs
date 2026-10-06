@@ -15,6 +15,7 @@ pub async fn run_chat(
     let mut model_id = model.unwrap_or_else(|| ctx.config.model.default.clone());
     let n_ctx = ctx_n.unwrap_or(ctx.config.model.n_ctx);
     let mut effort = ctx.config.model.effort.clone();
+    let mut shell_mode = ctx.config.tools.shell_mode.clone();
     let seed_val = seed.unwrap_or(ctx.config.model.seed);
 
     if ctx.is_json() {
@@ -111,6 +112,7 @@ pub async fn run_chat(
                     &mut show_sources,
                     &mut model_id,
                     &mut effort,
+                    &mut shell_mode,
                 )
                 .await?
                 {
@@ -261,6 +263,7 @@ fn live_temp(flag: Option<f32>, effort: &str, ctx: &Ctx) -> f32 {
     aicli_core::config::resolve_temp(flag, ctx.config.model.temp_chat, 0.6, effort)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_slash(
     ctx: &Ctx,
     conn: &rusqlite::Connection,
@@ -269,6 +272,7 @@ async fn handle_slash(
     show_sources: &mut bool,
     model_id: &mut String,
     effort: &mut String,
+    shell_mode: &mut String,
 ) -> anyhow::Result<bool> {
     let theme = &ctx.theme;
     if !input.starts_with('/') {
@@ -282,7 +286,7 @@ async fn handle_slash(
                 aicli_ui::panel::render_panel(
                     theme,
                     "Commands",
-                    "/help /new [title] /sessions /open <id> /model [id]\n/insert <file.gguf> [--name id] [--ctx n] /setting [set k v] /effort [level]\n/budget /compact /export [md|json] /sources /plain /clear /quit\nKeys: Ctrl+C stop  Ctrl+D exit  Ctrl+L clear  Ctrl+R history"
+                    "/help /new [title] /sessions /open <id> /model [id]\n/manage /ollama <list|pull|rm|show> /insert <file.gguf> /setting [set k v] /effort [level]\n/budget /compact /export [md|json] /sources /plain /clear /quit\nKeys: Ctrl+C stop  Ctrl+D exit  Ctrl+L clear  Ctrl+R history"
                 )
             );
             Ok(true)
@@ -443,7 +447,12 @@ async fn handle_slash(
         }
         ["/setting", "set", key, value] => {
             match crate::settings::apply_setting(ctx, key, value) {
-                Ok(msg) => println!("{}", theme.ok(&msg)),
+                Ok(msg) => {
+                    if *key == "shell" {
+                        *shell_mode = (*value).to_string();
+                    }
+                    println!("{}", theme.ok(&msg));
+                }
                 Err(e) => println!("{}", theme.warn(&e)),
             }
             Ok(true)
@@ -530,6 +539,169 @@ async fn handle_slash(
             );
             Ok(true)
         }
+        ["/manage"] => {
+            use aicli_models::ollama as ol;
+            let omodels = ol::list().unwrap_or_default();
+            let gmodels = aicli_models::list_all(&ctx.paths.models_dir);
+            let mut body = String::from("Ollama (install + delete):\n");
+            if omodels.is_empty() {
+                body.push_str("- none, run: /ollama pull <name>\n");
+            }
+            for m in &omodels {
+                body.push_str(&format!("- {} ({} MB)\n", m.name, ol::size_mb(m.size)));
+            }
+            body.push_str("\nGGUF (delete only, no download):\n");
+            for m in &gmodels {
+                let p = aicli_models::local_path(&ctx.paths.models_dir, m);
+                body.push_str(&format!(
+                    "- {} ({} MB, {})\n",
+                    m.id,
+                    m.size_mb,
+                    if p.exists() { "cached" } else { "missing" }
+                ));
+            }
+            body.push_str("\nFull page lives in the TUI: run bare `zai` then /manage.");
+            println!(
+                "{}",
+                aicli_ui::panel::render_panel(theme, "Manage", body.trim())
+            );
+            Ok(true)
+        }
+        ["/ollama", op, rest @ ..] => {
+            use aicli_models::ollama as ol;
+            match *op {
+                "list" => match ol::list() {
+                    Ok(models) if models.is_empty() => {
+                        println!(
+                            "{}",
+                            theme.warn("no ollama models, run: /ollama pull <name>")
+                        )
+                    }
+                    Ok(models) => {
+                        for m in &models {
+                            println!("- {} ({} MB)", m.name, ol::size_mb(m.size));
+                        }
+                    }
+                    Err(e) => println!("{}", theme.danger(&format!("ollama list failed: {e}"))),
+                },
+                "pull" => {
+                    if rest.is_empty() {
+                        println!("{}", theme.muted("usage: /ollama pull <name>"));
+                    } else {
+                        let name = rest.join(" ");
+                        println!("{}", theme.bold(&format!("pull ollama model {name}")));
+                        match ol::pull(&name, |_| {}) {
+                            Ok(()) => println!("{}", theme.ok(&format!("pulled {name}"))),
+                            Err(e) => println!("{}", theme.danger(&format!("pull failed: {e}"))),
+                        }
+                    }
+                }
+                "rm" | "delete" | "remove" => {
+                    if rest.is_empty() {
+                        println!("{}", theme.muted("usage: /ollama rm <name>"));
+                    } else {
+                        let name = rest.join(" ");
+                        match ol::rm(name.trim()) {
+                            Ok(()) => println!("{}", theme.ok(&format!("deleted {name}"))),
+                            Err(e) => println!("{}", theme.danger(&format!("rm failed: {e}"))),
+                        }
+                    }
+                }
+                "show" => {
+                    if rest.is_empty() {
+                        println!("{}", theme.muted("usage: /ollama show <name>"));
+                    } else {
+                        let name = rest.join(" ");
+                        match ol::show(name.trim()) {
+                            Ok(v) => {
+                                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default())
+                            }
+                            Err(e) => println!("{}", theme.danger(&format!("show failed: {e}"))),
+                        }
+                    }
+                }
+                "status" => {
+                    let up = if aicli_models::ollama::daemon_reachable() {
+                        "reachable at 127.0.0.1:11434"
+                    } else {
+                        "down, start with: ollama serve"
+                    };
+                    println!("{}", theme.muted(&format!("ollama daemon {up}")));
+                }
+                _ => println!(
+                    "{}",
+                    theme.muted("usage: /ollama <list|pull|rm|show|status> [name]")
+                ),
+            }
+            Ok(true)
+        }
+        ["/ollama"] => {
+            let up = if aicli_models::ollama::daemon_reachable() {
+                "reachable"
+            } else {
+                "down, start with: ollama serve"
+            };
+            println!("{}", theme.muted(&format!("ollama daemon {up}")));
+            Ok(true)
+        }
+        ["/run", rest @ ..] => {
+            let full = rest.join(" ").trim().to_string();
+            if full.is_empty() {
+                println!("{}", theme.muted("usage: /run <cmd>"));
+                return Ok(true);
+            }
+            match aicli_tools::check_shell_full(
+                &full,
+                shell_mode,
+                &ctx.config.tools.shell_allowlist,
+                &ctx.config.tools.shell_denylist,
+            ) {
+                aicli_tools::GateDecision::Deny { reason, hint } => {
+                    println!("{}", theme.danger(&format!("denied: {reason}. {hint}")));
+                    return Ok(true);
+                }
+                aicli_tools::GateDecision::Allow => {}
+            }
+            let auto_yes = std::env::var("ZAI_AUTO_YES")
+                .or_else(|_| std::env::var("AICLI_AUTO_YES"))
+                .is_ok();
+            if shell_mode != "allow" && ctx.config.tools.confirm_shell && !auto_yes {
+                use std::io::Write;
+                print!("run `{full}`? [yes/no]> ");
+                let _ = std::io::stdout().flush();
+                let mut ans = String::new();
+                std::io::stdin().read_line(&mut ans)?;
+                if ans.trim().to_lowercase() != "yes" {
+                    println!("{}", theme.warn("aborted, nothing ran"));
+                    return Ok(true);
+                }
+            }
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            match aicli_tools::run_blocking(
+                &full,
+                &cwd,
+                shell_mode,
+                &ctx.config.tools.shell_allowlist,
+                &ctx.config.tools.shell_denylist,
+                std::time::Duration::from_secs(60),
+                Some(&ctx.paths.logs_dir.join("run.log")),
+            ) {
+                Ok((preview, _, code)) => {
+                    let _ = aicli_tools::log_event(
+                        &ctx.paths.data_dir,
+                        "shell.run",
+                        Some(session_id),
+                        &format!("cmd={full} exit={code}"),
+                    );
+                    println!("{preview}");
+                    if code != 0 {
+                        println!("{}", theme.warn(&format!("exit {code}")));
+                    }
+                }
+                Err(e) => println!("{}", theme.danger(&format!("run failed: {e}"))),
+            }
+            Ok(true)
+        }
         ["/daily"] => {
             let report = aicli_core::store::week_report(&ctx.paths.data_dir);
             println!(
@@ -555,6 +727,8 @@ async fn handle_slash(
                 "/sessions",
                 "/open",
                 "/model",
+                "/manage",
+                "/ollama",
                 "/insert",
                 "/setting",
                 "/effort",

@@ -2,7 +2,7 @@
 
 Rust only CLI, single binary, local GGUF runtime, safe coding agent, daily capture, local RAG with citations.
 
-Status: v1.1.0. Bare `zai` opens the full screen TUI with sessions panel and `/` commands. Mock inference stream with real GGUF validate, budget, sessions, agent, daily, RAG. Real llama.cpp stream behind `llama` feature next.
+Status: v0.1.0-alpha. Bare `zai` opens the full screen TUI with sessions panel and `/` commands. Local brain answers math, code review, and security offline. Ollama models work when the daemon runs. Real llama.cpp stream behind `llama` feature next.
 
 ## Install
 
@@ -36,7 +36,11 @@ Flags: `--profile`, `--plain`, `--json`, `--quiet`, `--offline`, `--verbose`.
 ```text
 zai                           full screen UI, sessions left, / commands
 zai chat                      classic REPL with /help
+zai ask "2+3*4"               local brain math, code review, security guides
 zai ask "<q>" --show-sources    cited answer, --no-rag to skip retrieval
+zai ask "<q>" --model ollama/llama3.1  answer via Ollama daemon
+zai ollama list|pull|rm       manage Ollama models
+zai run -- <cmd>              shell under deny plus ask plus allow gate
 zai code "<goal>" --apply       12 step loop, atomic patch, allowlisted verify
 zai patch show|apply|drop       inspect pending diffs
 zai run -- <cmd>                allowlisted shell with approval

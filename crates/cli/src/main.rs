@@ -122,6 +122,11 @@ pub enum Cmd {
         #[command(subcommand)]
         op: ModelsOp,
     },
+    /// Ollama daemon models
+    Ollama {
+        #[command(subcommand)]
+        op: OllamaOp,
+    },
     /// Daily overview
     Daily {
         #[arg(long, default_value_t = false)]
@@ -209,6 +214,15 @@ pub enum ModelsOp {
     SetDefault {
         id: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum OllamaOp {
+    Status,
+    List,
+    Pull { name: String },
+    Rm { name: String },
+    Show { name: String },
 }
 
 #[derive(Subcommand, Debug)]

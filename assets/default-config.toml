@@ -11,6 +11,7 @@ temp_code = 0.2
 top_p = 0.9
 seed = 0
 timeout_s = 120
+effort = "Default"
 
 [index]
 paths = ["./docs", "./src"]
@@ -27,6 +28,7 @@ shell_denylist = ["rm -rf", "sudo", "mkfs"]
 auto_apply = false
 confirm_shell = true
 max_steps = 12
+shell_mode = "ask"
 
 [ui]
 theme = "auto"

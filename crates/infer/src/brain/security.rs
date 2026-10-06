@@ -1,22 +1,53 @@
 /// Defensive security guidance. Educational checklists, no exploit code.
 /// Each topic maps to concrete hardening steps with safe verification commands.
-
 /// Return the matched topic id for a query, if any.
 pub fn topic(query: &str) -> Option<&'static str> {
     let q = query.to_lowercase();
     let topics: &[(&str, &[&str])] = &[
         ("sqli", &["sql injection", "sqli", "sqlinject"]),
-        ("xss", &["xss", "cross site scripting", "cross-site scripting"]),
+        (
+            "xss",
+            &["xss", "cross site scripting", "cross-site scripting"],
+        ),
         ("csrf", &["csrf", "cross site request forgery"]),
-        ("passwords", &["password", "hashing", "bcrypt", "argon2", "credential"]),
-        ("secrets", &["secret", "api key", "apikey", "leak", "env file", ".env"]),
+        (
+            "passwords",
+            &["password", "hashing", "bcrypt", "argon2", "credential"],
+        ),
+        (
+            "secrets",
+            &["secret", "api key", "apikey", "leak", "env file", ".env"],
+        ),
         ("ssh", &["ssh", "sshd", "key auth"]),
         ("tls", &["tls", "ssl", "https", "certificate", "certbot"]),
         ("phishing", &["phishing", "phish", "social engineering"]),
         ("malware", &["malware", "ransomware", "virus", "trojan"]),
         ("firewall", &["firewall", "iptables", "ufw", "firewalld"]),
-        ("pentest", &["pentest", "penetration", "nmap", "port scan", "metasploit", "burp", "owasp", "vulnerability scan", "wireshark"]),
-        ("auth", &["jwt", "oauth", "session fixation", "2fa", "mfa", "authentication"]),
+        (
+            "pentest",
+            &[
+                "pentest",
+                "penetration",
+                "nmap",
+                "port scan",
+                "metasploit",
+                "burp",
+                "owasp",
+                "vulnerability scan",
+                "wireshark",
+            ],
+        ),
+        (
+            "auth",
+            &[
+                "jwt",
+                "oauth",
+                "session fixation",
+                "2fa",
+                "mfa",
+                "authentication",
+            ],
+        ),
     ];
     for (id, keys) in topics {
         if keys.iter().any(|k| q.contains(k)) {

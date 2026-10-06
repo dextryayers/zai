@@ -1,5 +1,5 @@
 use crate::MemoryOp;
-use crate::{output, repl, Cmd, Ctx, ModelsOp, NotesOp, PatchOp, SessionsOp, TasksOp};
+use crate::{output, repl, Cmd, Ctx, ModelsOp, NotesOp, OllamaOp, PatchOp, SessionsOp, TasksOp};
 use aicli_ui::{markdown, panel, progress, status, table};
 use serde::Serialize;
 
@@ -71,6 +71,7 @@ pub async fn dispatch(ctx: Ctx) -> anyhow::Result<()> {
             status,
         }) => cmd_index(&ctx, path, *rebuild, *eval, *status),
         Some(Cmd::Models { op }) => cmd_models(&ctx, op),
+        Some(Cmd::Ollama { op }) => cmd_ollama(&ctx, op),
         Some(Cmd::Daily {
             today,
             week,
@@ -272,7 +273,8 @@ fn cmd_ask(
     }
 
     // Shared router: local brain, then Ollama, then mock. See answer.rs.
-    let routed = crate::answer::compose_answer(ctx, query, &model_id, &sampler, &usage.prompt, n_ctx);
+    let routed =
+        crate::answer::compose_answer(ctx, query, &model_id, &sampler, &usage.prompt, n_ctx);
     let backend_note = routed.backend_note;
     let answer = routed.text;
     let brain_kind = routed.brain;
@@ -1541,6 +1543,142 @@ fn cmd_models(ctx: &Ctx, op: &ModelsOp) -> anyhow::Result<()> {
     }
 }
 
+fn cmd_ollama(ctx: &Ctx, op: &OllamaOp) -> anyhow::Result<()> {
+    use aicli_models::ollama as ol;
+    let theme = &ctx.theme;
+    let status_line = || {
+        format!(
+            "daemon {}, binary {}",
+            if ol::daemon_reachable() {
+                "reachable at 127.0.0.1:11434"
+            } else {
+                "down, start with: ollama serve"
+            },
+            if ol::binary_exists() {
+                "installed"
+            } else {
+                "missing, see https://ollama.com"
+            }
+        )
+    };
+    match op {
+        OllamaOp::Status => {
+            if ctx.is_json() {
+                #[derive(Serialize)]
+                struct Data {
+                    daemon: bool,
+                    binary: bool,
+                }
+                output::print_json(
+                    true,
+                    Data {
+                        daemon: ol::daemon_reachable(),
+                        binary: ol::binary_exists(),
+                    },
+                );
+            } else {
+                println!(
+                    "{}",
+                    panel::render_panel(theme, "Ollama status", &status_line())
+                );
+            }
+            Ok(())
+        }
+        OllamaOp::List => {
+            let models = ol::list().unwrap_or_default();
+            if ctx.is_json() {
+                output::print_json(true, &models);
+            } else if models.is_empty() {
+                println!(
+                    "{}",
+                    panel::render_panel(
+                        theme,
+                        "Ollama models",
+                        &format!("none installed or daemon down.\n{}\ninstall with: zai ollama pull <name>", status_line())
+                    )
+                );
+            } else {
+                let rows: Vec<Vec<String>> = models
+                    .iter()
+                    .map(|m| {
+                        vec![
+                            format!("ollama/{}", m.name),
+                            format!("{} MB", ol::size_mb(m.size)),
+                            m.modified.get(..10).unwrap_or(&m.modified).to_string(),
+                        ]
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    table::render_table(
+                        theme,
+                        &["ID", "SIZE", "MODIFIED"],
+                        &rows,
+                        &[false, true, false]
+                    )
+                );
+            }
+            Ok(())
+        }
+        OllamaOp::Pull { name } => {
+            println!("{}", theme.bold(&format!("pull ollama model {name}")));
+            let quiet_json = ctx.is_json();
+            ol::pull(name, move |p| {
+                if quiet_json {
+                    return;
+                }
+                match p {
+                    Some((done, total, status)) if total > 0 => {
+                        print!(
+                            "\r{}",
+                            aicli_ui::progress::download_line(
+                                &status,
+                                done as f64 / (1024.0 * 1024.0),
+                                total as f64 / (1024.0 * 1024.0),
+                                0.0
+                            )
+                        );
+                        use std::io::Write;
+                        let _ = std::io::stdout().flush();
+                    }
+                    _ => {}
+                }
+            })?;
+            println!();
+            println!(
+                "{}",
+                theme.ok(&format!(
+                    "pulled {name}, use with: zai ask --session s1 --model ollama/{name} \"hi\""
+                ))
+            );
+            Ok(())
+        }
+        OllamaOp::Rm { name } => {
+            ol::rm(name)?;
+            println!("{}", theme.ok(&format!("deleted ollama model {name}")));
+            Ok(())
+        }
+        OllamaOp::Show { name } => {
+            let v = ol::show(name)?;
+            if ctx.is_json() {
+                output::print_json(true, &v);
+            } else {
+                println!(
+                    "{}",
+                    markdown::render_markdown(
+                        theme,
+                        &format!(
+                            "```json\n{}\n```",
+                            serde_json::to_string_pretty(&v).unwrap_or_default()
+                        )
+                    )
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
 fn cmd_daily(
     ctx: &Ctx,
     today: bool,
@@ -2177,6 +2315,9 @@ fn cmd_doctor(
             effort: String,
             n_ctx: u32,
             model_cached: bool,
+            shell_mode: String,
+            ollama_daemon: bool,
+            brain_ok: bool,
         }
         let entry = aicli_models::find_any(&ctx.paths.models_dir, &ctx.config.model.default);
         let cached = entry
@@ -2196,6 +2337,9 @@ fn cmd_doctor(
                 effort: ctx.config.model.effort.clone(),
                 n_ctx: ctx.config.model.n_ctx,
                 model_cached: cached,
+                shell_mode: ctx.config.tools.shell_mode.clone(),
+                ollama_daemon: aicli_models::ollama::daemon_reachable(),
+                brain_ok: aicli_infer::brain::math::eval("7*6").ok() == Some(42.0),
             },
         );
         return Ok(());
@@ -2212,6 +2356,20 @@ fn cmd_doctor(
             }
         })
         .unwrap_or_else(|| "unknown model id".to_string());
+    // Brain self test: math plus intent routing must pass before release.
+    let brain_ok = aicli_infer::brain::math::eval("7*6").ok() == Some(42.0)
+        && aicli_infer::brain::classify("sqrt(16)") == aicli_infer::brain::Intent::Math
+        && aicli_infer::brain::security::topic("harden ssh").is_some();
+    let ollama_state = if aicli_models::ollama::daemon_reachable() {
+        match aicli_models::ollama::list() {
+            Ok(models) => format!("up, {} installed", models.len()),
+            Err(_) => "up, list failed".to_string(),
+        }
+    } else if aicli_models::ollama::binary_exists() {
+        "down, start with: ollama serve".to_string()
+    } else {
+        "not installed, see https://ollama.com".to_string()
+    };
     let rows = vec![
         vec!["profile".to_string(), ctx.paths.profile.clone()],
         vec![
@@ -2222,6 +2380,22 @@ fn cmd_doctor(
         vec!["model".to_string(), ctx.config.model.default.clone()],
         vec!["effort".to_string(), ctx.config.model.effort.clone()],
         vec!["model file".to_string(), cached],
+        vec![
+            "shell".to_string(),
+            format!(
+                "{} (deny blocks all, ask prompts, allow runs all)",
+                ctx.config.tools.shell_mode
+            ),
+        ],
+        vec!["ollama".to_string(), ollama_state],
+        vec![
+            "brain".to_string(),
+            if brain_ok {
+                "self test pass: math, intent, security".to_string()
+            } else {
+                "SELF TEST FAIL".to_string()
+            },
+        ],
         vec!["ctx".to_string(), format!("{}", ctx.config.model.n_ctx)],
         vec![
             "threads".to_string(),

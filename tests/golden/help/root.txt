@@ -10,6 +10,7 @@ Commands:
   run       Run allowlisted shell command
   index     Index a folder for RAG
   models    Manage GGUF models
+  ollama    Ollama daemon models
   daily     Daily overview
   tasks     Tasks by date
   notes     Notes search and capture

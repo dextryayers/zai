@@ -13,7 +13,11 @@ pub enum Slash {
         ctx: Option<u32>,
     },
     Manage,
-    Ollama { op: String, arg: Option<String> },
+    Ollama {
+        op: String,
+        arg: Option<String>,
+    },
+    Run(String),
     Setting {
         key: Option<String>,
         value: Option<String>,
@@ -76,6 +80,11 @@ pub const SLASHES: &[SlashMeta] = &[
         name: "/ollama",
         desc: "Ollama list, pull, rm, show, status",
         usage: "/ollama <list|pull|rm|show|status> [name]",
+    },
+    SlashMeta {
+        name: "/run",
+        desc: "Run a shell command under the shell mode gate",
+        usage: "/run <cmd>",
     },
     SlashMeta {
         name: "/setting",
@@ -208,8 +217,12 @@ pub fn parse(input: &str) -> Option<Slash> {
         }
         "/effort" => Some(Slash::Effort(parts.first().cloned())),
         "/manage" => Some(Slash::Manage),
+        "/run" => Some(Slash::Run(parts.join(" "))),
         "/ollama" => Some(Slash::Ollama {
-            op: parts.first().cloned().unwrap_or_else(|| "status".to_string()),
+            op: parts
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "status".to_string()),
             arg: parts.get(1).cloned(),
         }),
         "/budget" => Some(Slash::Budget),
@@ -262,6 +275,10 @@ mod tests {
         );
         assert_eq!(parse("hello"), None);
         assert_eq!(parse("/manage"), Some(Slash::Manage));
+        assert_eq!(
+            parse("/run git status"),
+            Some(Slash::Run("git status".to_string()))
+        );
         assert_eq!(
             parse("/ollama pull llama3.1"),
             Some(Slash::Ollama {

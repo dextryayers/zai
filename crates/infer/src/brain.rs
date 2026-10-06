@@ -1,8 +1,8 @@
+pub mod code;
 /// Offline reasoning engine: math evaluator, code analyzer, security advisor.
 /// No network, no model download. Deterministic and testable.
 /// General questions fall through to RAG plus mock or Ollama backends.
 pub mod math;
-pub mod code;
 pub mod security;
 
 use serde::{Deserialize, Serialize};
@@ -63,7 +63,10 @@ pub fn compose(query: &str) -> Option<BrainSection> {
             let report = code::analyze(query);
             Some(BrainSection {
                 kind: "code-analysis".to_string(),
-                title: format!("{}: {} lines, {} functions", report.language, report.lines, report.functions),
+                title: format!(
+                    "{}: {} lines, {} functions",
+                    report.language, report.lines, report.functions
+                ),
                 body_md: report.to_markdown(),
             })
         }

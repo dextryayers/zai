@@ -43,7 +43,9 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
             while j < chars.len() && chars[j].is_ascii_alphanumeric() {
                 j += 1;
             }
-            out.push(Tok::Name(chars[i..j].iter().collect::<String>().to_lowercase()));
+            out.push(Tok::Name(
+                chars[i..j].iter().collect::<String>().to_lowercase(),
+            ));
             i = j;
         } else {
             return Err(format!("unexpected char {c}"));
@@ -238,8 +240,12 @@ pub fn format_num(v: f64) -> String {
 fn is_date_or_version(s: &str) -> bool {
     let t = s.trim();
     // YYYY-MM-DD dates and x.y.z versions must not parse as math.
-    let parts: Vec<&str> = t.split(|c| c == '-' || c == '.' || c == '/').collect();
-    if parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())) {
+    let parts: Vec<&str> = t.split(['-', '.', '/']).collect();
+    if parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+    {
         return true;
     }
     false
@@ -251,10 +257,17 @@ pub fn extract_expr(query: &str) -> Option<String> {
     let mut q = query.trim().to_string();
     // Strip trigger words in Indonesian and English.
     for prefix in [
-        "hitung", "berapa", "kalkulasi", "calc", "calculate", "compute", "eval", "math",
+        "hitung",
+        "berapa",
+        "kalkulasi",
+        "calc",
+        "calculate",
+        "compute",
+        "eval",
+        "math",
     ] {
         if let Some(rest) = q.strip_prefix(prefix) {
-            let rest = rest.trim_start_matches(|c| c == ':' || c == '=' || c == ' ').trim();
+            let rest = rest.trim_start_matches([':', '=', ' ']).trim();
             if !rest.is_empty() {
                 q = rest.to_string();
                 break;
@@ -265,13 +278,13 @@ pub fn extract_expr(query: &str) -> Option<String> {
     if q.len() < 3 || is_date_or_version(q) {
         return None;
     }
-    // Must contain at least one operator and only math vocabulary.
-    if !q.chars().any(|c| "+-*/%^".contains(c)) {
+    // Must contain at least one operator or function call, plus only math vocabulary.
+    if !q.chars().any(|c| "+-*/%^()".contains(c)) {
         return None;
     }
-    let allowed = q.chars().all(|c| {
-        c.is_ascii_alphanumeric() || "+-*/%^()., \t".contains(c)
-    });
+    let allowed = q
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "+-*/%^()., \t".contains(c));
     if !allowed {
         return None;
     }
@@ -299,7 +312,7 @@ mod tests {
     fn functions_and_constants() {
         assert!((eval("sqrt(16)").unwrap() - 4.0).abs() < 1e-9);
         assert!((eval("sin(0)+cos(0)").unwrap() - 1.0).abs() < 1e-9);
-        assert!((eval("2*pi").unwrap() - 6.283185).abs() < 1e-5);
+        assert!((eval("2*pi").unwrap() - std::f64::consts::TAU).abs() < 1e-9);
     }
 
     #[test]
@@ -313,7 +326,10 @@ mod tests {
     #[test]
     fn extraction_guards() {
         assert_eq!(extract_expr("hitung 2+3*4").as_deref(), Some("2+3*4"));
-        assert_eq!(extract_expr("berapa (10-2)/4?").as_deref(), Some("(10-2)/4"));
+        assert_eq!(
+            extract_expr("berapa (10-2)/4?").as_deref(),
+            Some("(10-2)/4")
+        );
         assert_eq!(extract_expr("2026-10-06"), None);
         assert_eq!(extract_expr("1.1.0"), None);
         assert_eq!(extract_expr("hello world"), None);

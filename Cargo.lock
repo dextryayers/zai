@@ -71,6 +71,7 @@ dependencies = [
  "indicatif",
  "reqwest",
  "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "toml",

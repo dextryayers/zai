@@ -10,6 +10,9 @@ every action is a `/` command with Tab completion popup.
 /new [title]                  new session
 /sessions, /open <id>         browse and resume
 /model [id]                   picker overlay or direct switch
+/manage                       manage page: Ollama tab plus GGUF tab
+/ollama <list|pull|rm|show>   Ollama daemon models
+/run <cmd>                    shell under the shell mode gate
 /insert <file.gguf> [--name id] [--ctx n]   save a GGUF, unlimited models
 /setting [set <key> <value>]  settings page
 /effort [level]               Default Low Medium High XHigh Expert
@@ -59,13 +62,29 @@ Keys: Ctrl+C stops stream, Ctrl+D exits, Up and Down recall history.
 zai index ./docs --rebuild
 zai index ./docs --status
 zai ask "where is thread pool built" --index ./docs --show-sources
+zai ask "hitung 12* (3+4)"          # local brain math, offline
+zai ask "how to prevent xss"        # local security playbook
 zai ask "hello" --show-budget --top-k 5
 zai ask "hello" --no-rag
+zai ask "hello" --model ollama/llama3.1   # needs ollama serve
 zai ask "hello" --json | python3 -m json.tool
 zai index --eval
 ```
 
 Citations show `path:start-end score= bm25= vec=`. Stale index errors print rebuild fix.
+
+## Shell access
+
+Three modes, set by you only: `deny` blocks all shell, `ask` prompts on
+allowlisted commands, `allow` runs any command without prompt.
+
+```bash
+zai config set shell ask
+zai run -- git status
+zai run -- echo hi   # denied in ask mode unless allowlisted
+```
+
+Every run is logged to `logs/run.log` plus the events table.
 
 ## Code agent
 
@@ -104,6 +123,13 @@ zai models insert ~/models/tiny-q4_k_m.gguf --name tiny --ctx 2048
 zai models set-default tiny
 zai models verify tiny
 zai models pull qwen2.5-3b-instruct-q4_k_m
+zai ollama status
+zai ollama list
+zai ollama pull llama3.1
+zai ollama rm llama3.1
 zai doctor
 zai doctor --bench-load --bench-gen 64
 ```
+
+GGUF files are local only: insert from disk, delete from cache, never download.
+Ollama models install and delete through the daemon.

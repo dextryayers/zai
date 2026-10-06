@@ -201,12 +201,25 @@ enum Overlay {
     Effort {
         sel: usize,
     },
+    Manage {
+        ollama_tab: bool,
+        items: Vec<ManageRow>,
+        sel: usize,
+        confirm: Option<String>,
+    },
     Insert {
         label: String,
         done: u64,
         total: u64,
         finished: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManageRow {
+    id: String,
+    detail: String,
+    ollama: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -363,16 +376,11 @@ fn run_app(ctx: Ctx, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>)
         {
             if start.elapsed() > Duration::from_millis(450) {
                 let sampler = sampler_for_ctx(&ctx, &effort, None);
-                let history: Vec<(String, String)> =
-                    aicli_core::db::open(&ctx.paths.db_file)
-                        .ok()
-                        .and_then(|c| {
-                            aicli_core::sessions::list_turns(&c, &session.id).ok()
-                        })
-                        .map(|v| {
-                            v.into_iter().map(|t| (t.role, t.content)).collect()
-                        })
-                        .unwrap_or_default();
+                let history: Vec<(String, String)> = aicli_core::db::open(&ctx.paths.db_file)
+                    .ok()
+                    .and_then(|c| aicli_core::sessions::list_turns(&c, &session.id).ok())
+                    .map(|v| v.into_iter().map(|t| (t.role, t.content)).collect())
+                    .unwrap_or_default();
                 let prompt = aicli_infer::build_prompt(
                     "You are Zai, a local assistant. Answer concisely.",
                     &[],
@@ -436,6 +444,18 @@ fn run_app(ctx: Ctx, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>)
                     InsertMsg::Done(Err(e)) => {
                         overlay = Overlay::Insert {
                             label: "insert failed".to_string(),
+                            done: 0,
+                            total: 1,
+                            finished: Some(format!("error: {e}")),
+                        };
+                    }
+                    InsertMsg::DonePull(Ok(name)) => {
+                        overlay = Overlay::None;
+                        toast = Some((format!("pulled ollama model {name}"), Instant::now()));
+                    }
+                    InsertMsg::DonePull(Err(e)) => {
+                        overlay = Overlay::Insert {
+                            label: "pull failed".to_string(),
                             done: 0,
                             total: 1,
                             finished: Some(format!("error: {e}")),
@@ -776,6 +796,51 @@ fn draw(
                 Some(*sel),
             );
         }
+        Overlay::Manage {
+            ollama_tab,
+            items,
+            sel,
+            confirm,
+        } => {
+            let tab = if *ollama_tab {
+                "Ollama (install + delete)"
+            } else {
+                "GGUF (delete only, no download)"
+            };
+            let mut rows: Vec<ListItem> = items
+                .iter()
+                .map(|m| {
+                    ListItem::new(Line::from(vec![
+                        Span::styled(m.id.clone(), Style::default().fg(Color::White)),
+                        Span::raw(" "),
+                        Span::styled(m.detail.clone(), Style::default().fg(Color::DarkGray)),
+                    ]))
+                })
+                .collect();
+            if rows.is_empty() {
+                rows.push(ListItem::new(Line::from(Span::styled(
+                    if *ollama_tab {
+                        "no ollama models, press i then: /ollama pull <name>"
+                    } else {
+                        "no gguf files, press i then: /insert <file.gguf>"
+                    },
+                    Style::default().fg(Color::DarkGray),
+                ))));
+            }
+            if let Some(c) = confirm {
+                rows.push(ListItem::new(Line::from(vec![Span::styled(
+                    format!("delete {c}? press y to confirm, n to abort"),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )])));
+            }
+            popup_list(
+                f,
+                area,
+                &format!(" Manage {tab} - Tab switch, i install, d delete, r refresh, Esc close "),
+                &rows,
+                Some(*sel),
+            );
+        }
         Overlay::Insert {
             label,
             done,
@@ -798,12 +863,13 @@ fn draw(
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(3), Constraint::Length(2)])
                 .split(popup);
+            let title = if label.starts_with("pull ") {
+                " Pull Ollama "
+            } else {
+                " Insert GGUF "
+            };
             f.render_widget(
-                Paragraph::new(msg).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" Insert GGUF "),
-                ),
+                Paragraph::new(msg).block(Block::default().borders(Borders::ALL).title(title)),
                 inner[0],
             );
             f.render_widget(
@@ -878,6 +944,72 @@ fn popup_list(f: &mut Frame, area: Rect, title: &str, rows: &[ListItem], sel: Op
         popup,
         &mut state,
     );
+}
+
+/// Delete one row from the manage page. Ollama models via daemon, GGUF files locally.
+fn manage_delete(ctx: &Ctx, id: &str, ollama_tab: bool, toast: &mut Option<(String, Instant)>) {
+    if ollama_tab {
+        match aicli_models::ollama::rm(id) {
+            Ok(()) => *toast = Some((format!("deleted ollama model {id}"), Instant::now())),
+            Err(e) => *toast = Some((format!("delete failed: {e}"), Instant::now())),
+        }
+        return;
+    }
+    match aicli_models::remove_custom(&ctx.paths.models_dir, id) {
+        Ok(true) => *toast = Some((format!("deleted gguf {id}"), Instant::now())),
+        Ok(false) => {
+            // Builtin entry: drop the cached file, registry stays for re pull.
+            if let Some(entry) = aicli_models::find_any(&ctx.paths.models_dir, id) {
+                let p = aicli_models::local_path(&ctx.paths.models_dir, &entry);
+                if p.exists() && std::fs::remove_file(&p).is_ok() {
+                    *toast = Some((format!("deleted gguf file {id}"), Instant::now()));
+                } else {
+                    *toast = Some((format!("nothing cached for {id}"), Instant::now()));
+                }
+            } else {
+                *toast = Some((format!("unknown model {id}"), Instant::now()));
+            }
+        }
+        Err(e) => *toast = Some((format!("delete failed: {e}"), Instant::now())),
+    }
+}
+
+/// Manage rows split by tab. Ollama rows need a live daemon, GGUF rows are local only.
+fn refresh_manage(ctx: &Ctx) -> (Vec<ManageRow>, Vec<ManageRow>) {
+    let ollama_rows: Vec<ManageRow> = aicli_models::ollama::list()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| ManageRow {
+            id: m.name.clone(),
+            detail: format!(
+                "{} MB modified {}",
+                aicli_models::ollama::size_mb(m.size),
+                m.modified.get(..10).unwrap_or(m.modified.as_str())
+            ),
+            ollama: true,
+        })
+        .collect();
+    let gguf_rows: Vec<ManageRow> = aicli_models::list_all(&ctx.paths.models_dir)
+        .into_iter()
+        .map(|m| {
+            let p = aicli_models::local_path(&ctx.paths.models_dir, &m);
+            let detail = if p.exists() {
+                format!(
+                    "{} MB cached{}",
+                    m.size_mb,
+                    if m.repo == "local" { " local" } else { "" }
+                )
+            } else {
+                "not downloaded, GGUF has no download".to_string()
+            };
+            ManageRow {
+                id: m.id,
+                detail,
+                ollama: false,
+            }
+        })
+        .collect();
+    (ollama_rows, gguf_rows)
 }
 
 fn effort_rows(current: &str) -> Vec<(String, String, bool)> {
@@ -956,6 +1088,7 @@ fn mark_stopped(ctx: &Ctx, session_id: &str) {
 enum InsertMsg {
     Progress(u64, u64),
     Done(Result<aicli_models::ModelEntry, String>),
+    DonePull(Result<String, String>),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -984,6 +1117,74 @@ fn handle_key(
     use crossterm::event::KeyCode;
     // Overlay navigation first.
     match overlay {
+        Overlay::Manage {
+            ollama_tab,
+            items,
+            sel,
+            confirm,
+        } => match code {
+            KeyCode::Esc => {
+                if confirm.is_some() {
+                    *confirm = None;
+                } else {
+                    *overlay = Overlay::None;
+                }
+                return Ok(true);
+            }
+            KeyCode::Tab => {
+                *ollama_tab = !*ollama_tab;
+                let (o, g) = refresh_manage(ctx);
+                *items = if *ollama_tab { o } else { g };
+                *sel = 0;
+                *confirm = None;
+                return Ok(true);
+            }
+            KeyCode::Up => {
+                *sel = sel.saturating_sub(1);
+                return Ok(true);
+            }
+            KeyCode::Down => {
+                *sel = (*sel + 1).min(items.len().saturating_sub(1));
+                return Ok(true);
+            }
+            KeyCode::Char('r') => {
+                let (o, g) = refresh_manage(ctx);
+                *items = if *ollama_tab { o } else { g };
+                *confirm = None;
+                return Ok(true);
+            }
+            KeyCode::Char('i') => {
+                *input = if *ollama_tab {
+                    "/ollama pull ".to_string()
+                } else {
+                    "/insert ".to_string()
+                };
+                *cursor = input.chars().count();
+                *overlay = Overlay::None;
+                *focus_left = false;
+                return Ok(true);
+            }
+            KeyCode::Char('d') => {
+                if let Some(row) = items.get(*sel) {
+                    *confirm = Some(row.id.clone());
+                }
+                return Ok(true);
+            }
+            KeyCode::Char('y') => {
+                if let Some(id) = confirm.take() {
+                    manage_delete(ctx, &id, *ollama_tab, toast);
+                    let (o, g) = refresh_manage(ctx);
+                    *items = if *ollama_tab { o } else { g };
+                    *sel = 0;
+                }
+                return Ok(true);
+            }
+            KeyCode::Char('n') => {
+                *confirm = None;
+                return Ok(true);
+            }
+            _ => return Ok(true),
+        },
         Overlay::Models { items, sel } => match code {
             KeyCode::Esc => {
                 *overlay = Overlay::None;
@@ -1205,6 +1406,160 @@ fn common_prefix(matches: &[&crate::slash::SlashMeta]) -> Option<String> {
     Some(first[..len].to_string())
 }
 
+/// Execute /run inside the TUI under the shell mode gate.
+/// Approval prompts cannot block the event loop, so ask mode without
+/// auto yes points at the terminal command instead of hanging.
+fn run_in_tui(ctx: &Ctx, cmd: &str, messages: &mut Vec<Msg>) {
+    let full = cmd.trim();
+    if full.is_empty() {
+        messages.push(Msg::full(Role::Sys, "usage: /run <cmd>"));
+        return;
+    }
+    if let aicli_tools::GateDecision::Deny { reason, hint } = aicli_tools::check_shell_full(
+        full,
+        &ctx.config.tools.shell_mode,
+        &ctx.config.tools.shell_allowlist,
+        &ctx.config.tools.shell_denylist,
+    ) {
+        messages.push(Msg::full(Role::Sys, &format!("denied: {reason}. {hint}")));
+        return;
+    }
+    let auto_yes = std::env::var("ZAI_AUTO_YES")
+        .or_else(|_| std::env::var("AICLI_AUTO_YES"))
+        .is_ok();
+    if ctx.config.tools.shell_mode != "allow" && ctx.config.tools.confirm_shell && !auto_yes {
+        messages.push(Msg::full(
+            Role::Sys,
+            &format!("approval needed, run in terminal: zai run -- {full}\nor set: /setting set shell allow"),
+        ));
+        return;
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    match aicli_tools::run_blocking(
+        full,
+        &cwd,
+        &ctx.config.tools.shell_mode,
+        &ctx.config.tools.shell_allowlist,
+        &ctx.config.tools.shell_denylist,
+        std::time::Duration::from_secs(60),
+        Some(&ctx.paths.logs_dir.join("run.log")),
+    ) {
+        Ok((preview, _, code)) => {
+            let _ = aicli_tools::log_event(
+                &ctx.paths.data_dir,
+                "shell.run",
+                None,
+                &format!("cmd={full} exit={code}"),
+            );
+            messages.push(Msg::full(
+                Role::Sys,
+                &format!("$ {full} (exit {code})\n{preview}"),
+            ));
+        }
+        Err(e) => messages.push(Msg::full(Role::Sys, &format!("run failed: {e}"))),
+    }
+}
+
+/// Execute /ollama in the TUI. Pull runs in a thread with gauge progress.
+fn run_ollama_slash(
+    _ctx: &Ctx,
+    op: &str,
+    arg: Option<&str>,
+    messages: &mut Vec<Msg>,
+    toast: &mut Option<(String, Instant)>,
+    overlay: &mut Overlay,
+    insert_rx: &mut Option<mpsc::Receiver<InsertMsg>>,
+) {
+    match op {
+        "list" => match aicli_models::ollama::list() {
+            Ok(models) if models.is_empty() => {
+                messages.push(Msg::full(
+                    Role::Sys,
+                    "no ollama models installed. Run: /ollama pull <name>",
+                ));
+            }
+            Ok(models) => {
+                let body: String = models
+                    .iter()
+                    .map(|m| format!("{} ({} MB)", m.name, aicli_models::ollama::size_mb(m.size)))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                messages.push(Msg::full(Role::Sys, &format!("Ollama models:\n{body}")));
+            }
+            Err(e) => messages.push(Msg::full(Role::Sys, &format!("ollama list failed: {e}"))),
+        },
+        "pull" => {
+            let Some(name) = arg.filter(|s| !s.trim().is_empty()) else {
+                messages.push(Msg::full(Role::Sys, "usage: /ollama pull <name>"));
+                return;
+            };
+            let name = name.trim().to_string();
+            let (tx, rx) = mpsc::channel();
+            *insert_rx = Some(rx);
+            *overlay = Overlay::Insert {
+                label: format!("pull {name}"),
+                done: 0,
+                total: 1,
+                finished: None,
+            };
+            let tx2 = tx.clone();
+            std::thread::spawn(move || {
+                let res = aicli_models::ollama::pull(&name, move |p| {
+                    let (d, t) = p.map(|(d, t, _)| (d, t)).unwrap_or((0, 1));
+                    let _ = tx2.send(InsertMsg::Progress(d, t));
+                });
+                let _ = tx.send(InsertMsg::DonePull(
+                    res.map(|()| name).map_err(|e| e.to_string()),
+                ));
+            });
+        }
+        "rm" | "delete" | "remove" => {
+            let Some(name) = arg.filter(|s| !s.trim().is_empty()) else {
+                messages.push(Msg::full(Role::Sys, "usage: /ollama rm <name>"));
+                return;
+            };
+            match aicli_models::ollama::rm(name.trim()) {
+                Ok(()) => {
+                    *toast = Some((
+                        format!("deleted ollama model {}", name.trim()),
+                        Instant::now(),
+                    ))
+                }
+                Err(e) => messages.push(Msg::full(Role::Sys, &format!("ollama rm failed: {e}"))),
+            }
+        }
+        "show" => {
+            let Some(name) = arg.filter(|s| !s.trim().is_empty()) else {
+                messages.push(Msg::full(Role::Sys, "usage: /ollama show <name>"));
+                return;
+            };
+            match aicli_models::ollama::show(name.trim()) {
+                Ok(v) => messages.push(Msg::full(
+                    Role::Sys,
+                    &serde_json::to_string_pretty(&v).unwrap_or_default(),
+                )),
+                Err(e) => messages.push(Msg::full(Role::Sys, &format!("ollama show failed: {e}"))),
+            }
+        }
+        _ => {
+            let up = if aicli_models::ollama::daemon_reachable() {
+                "reachable"
+            } else {
+                "down, start with: ollama serve"
+            };
+            let bin = if aicli_models::ollama::binary_exists() {
+                "installed"
+            } else {
+                "missing, see https://ollama.com"
+            };
+            messages.push(Msg::full(
+                Role::Sys,
+                &format!("Ollama daemon {up}, binary {bin}.\nusage: /ollama <list|pull|rm|show|status> [name]"),
+            ));
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn submit(
     ctx: &Ctx,
@@ -1329,6 +1684,27 @@ fn submit(
                     *overlay = Overlay::Effort { sel };
                 }
             }
+            Slash::Manage => {
+                let (o, g) = refresh_manage(ctx);
+                *overlay = Overlay::Manage {
+                    ollama_tab: true,
+                    items: o,
+                    sel: 0,
+                    confirm: None,
+                };
+                let _ = g;
+            }
+            Slash::Ollama { op, arg } => {
+                run_ollama_slash(
+                    ctx,
+                    &op,
+                    arg.as_deref(),
+                    messages,
+                    toast,
+                    overlay,
+                    insert_rx,
+                );
+            }
             Slash::Budget => {
                 let (used, total) = ctx_usage(ctx, &session.id, "");
                 messages.push(Msg::full(
@@ -1372,6 +1748,9 @@ fn submit(
                     }
                 }
             }
+            Slash::Run(cmd) => {
+                run_in_tui(ctx, &cmd, messages);
+            }
             Slash::Sources => {
                 *show_sources = !*show_sources;
                 *toast = Some((
@@ -1413,7 +1792,7 @@ fn submit(
 }
 
 fn model_rows(ctx: &Ctx, active: &str) -> Vec<ModelRow> {
-    aicli_models::list_all(&ctx.paths.models_dir)
+    let mut rows: Vec<ModelRow> = aicli_models::list_all(&ctx.paths.models_dir)
         .into_iter()
         .map(|m| {
             let p = aicli_models::local_path(&ctx.paths.models_dir, &m);
@@ -1432,7 +1811,19 @@ fn model_rows(ctx: &Ctx, active: &str) -> Vec<ModelRow> {
                 active: m.id == active,
             }
         })
-        .collect()
+        .collect();
+    // Installed Ollama models appear as ollama/<name> when the daemon is up.
+    for m in aicli_models::ollama::list().unwrap_or_default() {
+        let id = aicli_models::ollama::to_id(&m.name);
+        rows.push(ModelRow {
+            id: id.clone(),
+            quant: "ollama".to_string(),
+            size: format!("{} MB", aicli_models::ollama::size_mb(m.size)),
+            status: "daemon".to_string(),
+            active: id == active,
+        });
+    }
+    rows
 }
 
 fn start_insert(

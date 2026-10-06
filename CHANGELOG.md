@@ -2,6 +2,16 @@
 All notable changes to this project will be documented in this file.
 Format follows Keep a Changelog. Versions follow SemVer.
 
+## [0.1.0-alpha] - 2026-10-06
+### Added
+- Version channel reset to alpha. Note: cargo needs semver, so V0.0.1.0 is not a valid version string and 0.1.0-alpha is used.
+- Local brain: offline math evaluator with precedence plus functions, code reader with language detect plus risk flags, defensive security playbooks for 12 topics, intent router wired into ask, chat, and TUI
+- Full terminal access by permission: shell modes deny plus ask plus allow, allow needs explicit user opt in with warning banner, every run logged
+- Ollama support: daemon detect, list, pull with progress, rm, show, generate routing for ollama/ model ids in ask, chat, and TUI
+- Manage page: TUI overlay with Ollama and GGUF tabs, install via input prefill, delete with inline confirm, refresh; GGUF delete only, never download
+- CLI parity: zai ollama list plus pull plus rm plus show plus status, zai models insert for unlimited local GGUF, set-default writes config, doctor gains shell plus ollama plus brain self test rows
+- REPL and TUI gain /manage /ollama /run, shared slash parser plus settings helpers, fixed Tokio panic on blocking HTTP by isolating calls on dedicated threads
+
 ## [1.1.0] - 2026-10-06
 ### Added
 - Full screen TUI on bare `zai`: left sessions panel with Tab focus plus Enter to open, main chat with styled markdown, slash completion popup, help plus models plus settings plus effort overlays, insert progress gauge, toasts, boot splash, thinking spinner with elapsed time, smooth styled streaming reveal
