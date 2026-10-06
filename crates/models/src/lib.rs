@@ -43,6 +43,199 @@ pub fn find_model(id: &str) -> Option<ModelEntry> {
     builtin_registry().into_iter().find(|m| m.id == id)
 }
 
+/// Path of the user model registry inside the models cache dir.
+pub fn custom_path(models_dir: &Path) -> PathBuf {
+    models_dir.join("custom-models.toml")
+}
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct CustomRegistry {
+    #[serde(default)]
+    models: Vec<ModelEntry>,
+}
+
+/// Load user inserted models. Missing or corrupt file means empty list.
+pub fn load_custom(models_dir: &Path) -> Vec<ModelEntry> {
+    let p = custom_path(models_dir);
+    if !p.exists() {
+        return vec![];
+    }
+    let text = std::fs::read_to_string(&p).unwrap_or_default();
+    toml::from_str::<CustomRegistry>(&text)
+        .map(|r| r.models)
+        .unwrap_or_default()
+}
+
+fn save_custom(models_dir: &Path, models: &[ModelEntry]) -> Result<()> {
+    std::fs::create_dir_all(models_dir)?;
+    let text = toml::to_string_pretty(&CustomRegistry {
+        models: models.to_vec(),
+    })?;
+    std::fs::write(custom_path(models_dir), text)?;
+    Ok(())
+}
+
+/// All known models: user inserts first, then builtin without id clash.
+pub fn list_all(models_dir: &Path) -> Vec<ModelEntry> {
+    let custom = load_custom(models_dir);
+    let ids: std::collections::HashSet<String> = custom.iter().map(|m| m.id.clone()).collect();
+    let mut out = custom;
+    for b in builtin_registry() {
+        if !ids.contains(&b.id) {
+            out.push(b);
+        }
+    }
+    out
+}
+
+/// Find in user models first, then builtin.
+pub fn find_any(models_dir: &Path, id: &str) -> Option<ModelEntry> {
+    list_all(models_dir).into_iter().find(|m| m.id == id)
+}
+
+fn sanitize_id(raw: &str) -> Result<String> {
+    let clean: String = raw
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let clean = clean.trim_matches('-').to_string();
+    anyhow::ensure!(
+        (1..=64).contains(&clean.len()),
+        "model id must be 1-64 chars of letters, digits, dash"
+    );
+    Ok(clean)
+}
+
+fn guess_quant(name: &str) -> String {
+    let upper = name.to_ascii_uppercase();
+    for q in [
+        "Q8_0", "Q6_K", "Q5_K_M", "Q5_K_S", "Q4_K_M", "Q4_K_S", "Q4_0", "Q3_K_M", "Q2_K",
+    ] {
+        if upper.contains(q) {
+            return q.to_string();
+        }
+    }
+    "unknown".to_string()
+}
+
+/// Validate GGUF header: magic plus version range. Returns version and tensor count.
+pub fn check_gguf_header(path: &Path) -> Result<(u32, u64)> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut hdr = [0u8; 16];
+    f.read_exact(&mut hdr)
+        .with_context(|| format!("{} too small to be GGUF", path.display()))?;
+    anyhow::ensure!(
+        &hdr[0..4] == b"GGUF",
+        "{} has bad GGUF magic",
+        path.display()
+    );
+    let version = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+    anyhow::ensure!(
+        (1..=10).contains(&version),
+        "unsupported GGUF version {version}"
+    );
+    let tensors = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
+    Ok((version, tensors))
+}
+
+/// Insert a local GGUF file into the models cache and registry.
+/// Copies with progress callback (done_bytes, total_bytes), verifies header and sha256.
+/// Accepts unlimited models. Returns the saved entry.
+pub fn insert_gguf(
+    models_dir: &Path,
+    src: &Path,
+    name: Option<&str>,
+    n_ctx: Option<u32>,
+    mut on_progress: impl FnMut(u64, u64),
+) -> Result<ModelEntry> {
+    anyhow::ensure!(src.exists(), "file not found: {}", src.display());
+    let (version, _tensors) = check_gguf_header(src)?;
+    let _ = version;
+    let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("model");
+    let id = sanitize_id(name.unwrap_or(stem))?;
+    if find_any(models_dir, &id).is_some() {
+        anyhow::bail!("model id {id} already saved, remove it first or pick another --name");
+    }
+    let file_name = src
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow::anyhow!("bad file name"))?
+        .to_string();
+    let dest = models_dir.join(&file_name);
+    if dest.exists() {
+        anyhow::bail!("file {} already in cache", dest.display());
+    }
+    std::fs::create_dir_all(models_dir)?;
+    let total = std::fs::metadata(src)?.len();
+    {
+        use std::io::{Read, Write};
+        let mut r = std::fs::File::open(src)?;
+        let mut w = std::fs::File::create(&dest)?;
+        let mut buf = [0u8; 262144];
+        let mut done = 0u64;
+        loop {
+            let n = r.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            w.write_all(&buf[..n])?;
+            done += n as u64;
+            on_progress(done, total);
+        }
+    }
+    let sha = {
+        use sha2::{Digest, Sha256};
+        use std::io::Read;
+        let mut h = Sha256::new();
+        let mut f = std::fs::File::open(&dest)?;
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = f.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            h.update(&buf[..n]);
+        }
+        format!("{:x}", h.finalize())
+    };
+    let entry = ModelEntry {
+        id: id.clone(),
+        repo: "local".to_string(),
+        file: file_name,
+        quant: guess_quant(&id),
+        size_mb: (std::fs::metadata(&dest)?.len() / (1024 * 1024)).max(1),
+        n_ctx: n_ctx.unwrap_or(4096),
+        is_default: false,
+        sha256: Some(sha),
+    };
+    let mut custom = load_custom(models_dir);
+    custom.push(entry.clone());
+    save_custom(models_dir, &custom)?;
+    Ok(entry)
+}
+
+/// Remove a user inserted model file plus registry entry.
+pub fn remove_custom(models_dir: &Path, id: &str) -> Result<bool> {
+    let mut custom = load_custom(models_dir);
+    let before = custom.len();
+    custom.retain(|m| m.id != id);
+    if custom.len() == before {
+        return Ok(false);
+    }
+    // Remove file only when no builtin shares the name.
+    if let Some(entry) = list_all(models_dir).into_iter().find(|m| m.id == id) {
+        let _ = std::fs::remove_file(local_path(models_dir, &entry));
+    }
+    save_custom(models_dir, &custom)?;
+    Ok(true)
+}
+
 pub fn hf_url(entry: &ModelEntry) -> String {
     format!(
         "https://huggingface.co/{}/resolve/main/{}",
@@ -224,5 +417,44 @@ mod tests {
             Some("0000000000000000000000000000000000000000000000000000000000000000")
         )
         .unwrap());
+    }
+
+    fn fake_gguf(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let p = dir.join(name);
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&5u64.to_le_bytes());
+        bytes.extend_from_slice(&10u64.to_le_bytes());
+        bytes.extend(vec![0u8; 64]);
+        std::fs::write(&p, &bytes).unwrap();
+        p
+    }
+
+    #[test]
+    fn insert_accepts_many_models() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("models");
+        for i in 0..3 {
+            let src = fake_gguf(tmp.path(), &format!("m{i}-q4_k_m.gguf"));
+            let e = insert_gguf(&cache, &src, None, Some(2048), |_, _| {}).unwrap();
+            assert!(local_path(&cache, &e).exists());
+        }
+        let all = list_all(&cache);
+        assert!(all.iter().filter(|m| m.repo == "local").count() == 3);
+        assert!(find_any(&cache, "m1-q4-k-m").is_some());
+    }
+
+    #[test]
+    fn insert_rejects_bad_magic_and_dupes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("models");
+        let bad = tmp.path().join("bad.gguf");
+        std::fs::write(&bad, b"NOPE").unwrap();
+        assert!(insert_gguf(&cache, &bad, None, None, |_, _| {}).is_err());
+        let src = fake_gguf(tmp.path(), "dup.gguf");
+        insert_gguf(&cache, &src, Some("dup"), None, |_, _| {}).unwrap();
+        assert!(insert_gguf(&cache, &src, Some("dup"), None, |_, _| {}).is_err());
+        assert!(remove_custom(&cache, "dup").unwrap());
+        assert!(find_any(&cache, "dup").is_none());
     }
 }

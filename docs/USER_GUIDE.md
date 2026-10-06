@@ -1,5 +1,29 @@
 # User Guide
 
+## Full screen UI
+
+Run bare `zai`. Left panel lists history sessions, main column is chat,
+every action is a `/` command with Tab completion popup.
+
+```text
+/help                         all commands
+/new [title]                  new session
+/sessions, /open <id>         browse and resume
+/model [id]                   picker overlay or direct switch
+/insert <file.gguf> [--name id] [--ctx n]   save a GGUF, unlimited models
+/setting [set <key> <value>]  settings page
+/effort [level]               Default Low Medium High XHigh Expert
+/budget, /compact, /export    context tools
+/sources, /clear, /quit       view controls
+```
+
+Keys: Up and Down history, Tab complete or switch panel, Enter open
+session when left panel focused, PageUp and PageDown scroll, Ctrl+C stop,
+Ctrl+D quit, Esc close overlay or clear input.
+
+Effort mapping: Low temp 0.3 tokens 256 steps 4, Medium 0.5 512 8,
+Default and High 0.6 1024 12 and 16, XHigh 0.7 2048 20, Expert 0.8 4096 24.
+
 ## Chat
 
 ```bash
@@ -76,8 +100,10 @@ Week shows counts only, no invented narrative. Memory is user owned, model reads
 
 ```bash
 zai models list
+zai models insert ~/models/tiny-q4_k_m.gguf --name tiny --ctx 2048
+zai models set-default tiny
+zai models verify tiny
 zai models pull qwen2.5-3b-instruct-q4_k_m
-zai models verify qwen2.5-3b-instruct-q4_k_m
 zai doctor
 zai doctor --bench-load --bench-gen 64
 ```

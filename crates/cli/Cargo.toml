@@ -1,6 +1,6 @@
 [package]
 name = "zai"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "Zai AI offline coding and daily assistant"
 default-run = "zai"
@@ -18,6 +18,8 @@ clap = { workspace = true }
 tokio = { workspace = true }
 rustyline = { workspace = true }
 rusqlite = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
 aicli-core = { path = "../core" }
 aicli-ui = { path = "../ui" }
 aicli-ingest = { path = "../ingest" }

@@ -32,6 +32,27 @@ pub struct ModelCfg {
     pub top_p: f32,
     pub seed: u64,
     pub timeout_s: u64,
+    #[serde(default = "default_effort")]
+    pub effort: String,
+}
+
+/// Effort levels. Each maps to temp, top_p, max output tokens, max agent steps.
+pub const EFFORT_LEVELS: &[&str] = &["Default", "Low", "Medium", "High", "XHigh", "Expert"];
+
+fn default_effort() -> String {
+    "Default".to_string()
+}
+
+pub fn effort_profile(level: &str) -> Option<(f32, f32, usize, u32)> {
+    match level {
+        "Default" => Some((0.6, 0.9, 1024, 12)),
+        "Low" => Some((0.3, 0.8, 256, 4)),
+        "Medium" => Some((0.5, 0.85, 512, 8)),
+        "High" => Some((0.6, 0.9, 1024, 16)),
+        "XHigh" => Some((0.7, 0.95, 2048, 20)),
+        "Expert" => Some((0.8, 0.95, 4096, 24)),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +98,7 @@ impl Default for Config {
                 top_p: 0.9,
                 seed: 0,
                 timeout_s: 120,
+                effort: "Default".to_string(),
             },
             index: IndexCfg {
                 paths: vec!["./docs".to_string(), "./src".to_string()],
@@ -155,6 +177,22 @@ impl Config {
                 self.profile.name = v;
             }
         }
+        if let Some(v) = env_first(&["ZAI_EFFORT"]) {
+            if !v.is_empty() {
+                self.model.effort = v;
+            }
+        }
+    }
+
+    /// Write config back to file. Creates parent dirs.
+    pub fn save(&self, config_file: &Path) -> Result<()> {
+        self.validate()?;
+        let text = toml::to_string_pretty(self)?;
+        if let Some(parent) = config_file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(config_file, text)?;
+        Ok(())
     }
 
     fn validate(&self) -> Result<()> {
@@ -170,6 +208,11 @@ impl Config {
         anyhow::ensure!(
             ["auto", "dark", "light", "plain"].contains(&self.ui.theme.as_str()),
             "theme must be auto, dark, light, plain"
+        );
+        anyhow::ensure!(
+            EFFORT_LEVELS.contains(&self.model.effort.as_str()),
+            "effort must be one of Default Low Medium High XHigh Expert, got {}",
+            self.model.effort
         );
         Ok(())
     }
@@ -189,5 +232,22 @@ mod tests {
         let mut c = Config::default();
         c.model.n_ctx = 999;
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn effort_levels_map() {
+        assert_eq!(effort_profile("Default"), Some((0.6, 0.9, 1024, 12)));
+        assert_eq!(effort_profile("Expert"), Some((0.8, 0.95, 4096, 24)));
+        assert_eq!(effort_profile("Nope"), None);
+        let mut c = Config::default();
+        c.model.effort = "Nope".to_string();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn old_config_without_effort_still_loads() {
+        let text = "[profile]\nname = \"default\"\n[model]\ndefault = \"m\"\nn_ctx = 4096\nn_threads = 0\nn_gpu_layers = 0\ntemp_chat = 0.6\ntemp_code = 0.2\ntop_p = 0.9\nseed = 0\ntimeout_s = 120\n[index]\npaths = []\next = []\nexclude = []\nchunk_tokens = 512\noverlap_tokens = 64\ntop_k = 5\nmax_file_mb = 5\n[tools]\nshell_allowlist = []\nshell_denylist = []\nauto_apply = false\nconfirm_shell = true\nmax_steps = 12\n[ui]\ntheme = \"auto\"\nright_rail = true\nstream_flush_ms = 16\n";
+        let cfg: Config = toml::from_str(text).unwrap();
+        assert_eq!(cfg.model.effort, "Default");
     }
 }

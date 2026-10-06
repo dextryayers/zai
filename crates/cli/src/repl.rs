@@ -1,8 +1,6 @@
 use crate::{output, Ctx};
 use aicli_ui::{markdown, progress, status};
 use serde::Serialize;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 
 /// Premium REPL with durable sessions, budget meter, and elegant streaming.
 pub async fn run_chat(
@@ -55,7 +53,7 @@ pub async fn run_chat(
         "{}",
         status::status_line(
             theme,
-            "1.0.0",
+            env!("CARGO_PKG_VERSION"),
             &model_id,
             0,
             n_ctx,
@@ -80,8 +78,8 @@ pub async fn run_chat(
                 "Title: {}\nTurns: {} {rec}\nModel {model_id} temp {:.1} seed {}\nType a message. /help for commands. {rail_hint}",
                 sess.title,
                 existing.len(),
-                sampler.seed,
                 sampler.temp,
+                sampler.seed,
                 rec = recovered
                     .map(|t| format!("(recovered stopped turn {})", t.id))
                     .unwrap_or_default(),
@@ -118,7 +116,7 @@ pub async fn run_chat(
                     .map(|t| (t.role.clone(), t.content.clone()))
                     .collect();
                 let usage = aicli_infer::build_prompt(
-                    "You are AICLI, a local assistant. Answer concisely.",
+                    "You are Zai, a local assistant. Answer concisely.",
                     &[],
                     &hist,
                     &input,
@@ -159,48 +157,31 @@ pub async fn run_chat(
                 let _ = aicli_core::sessions::mirror_append(&ctx.paths.sessions_dir, &user_turn);
 
                 let answer = aicli_infer::sampler::mock_answer_with_sampler(&input, &sampler);
-                print!("{} ", theme.bold("AICLI"));
-                println!("{}", theme.muted(&format!("[{model_id}]")));
+                println!(
+                    "{} {}",
+                    theme.bold("Zai"),
+                    theme.muted(&format!("[{model_id}]"))
+                );
 
-                // Elegant stream with cancel flag. Ctrl+C during stream is caught as
-                // Interrupted on next readline, here we stream to completion quickly.
-                let cancel = Arc::new(AtomicBool::new(false));
-                let cancel_clone = cancel.clone();
-                let answer_clone = answer.clone();
-                let flush_ms = ctx.config.ui.stream_flush_ms;
-                let timeout_s = ctx.config.model.timeout_s;
-                let (tx, rx) = std::sync::mpsc::channel::<String>();
-                std::thread::spawn(move || {
-                    aicli_infer::stream::stream_with_cancel(
-                        &answer_clone,
-                        flush_ms,
-                        std::time::Duration::from_secs(timeout_s),
-                        cancel_clone,
-                        |ev| {
-                            if let aicli_infer::stream::StreamEvent::Delta(d) = ev {
-                                let _ = tx.send(d);
-                            }
-                        },
+                // Thinking animation with elapsed timer, then one clean render.
+                // Single render avoids garbled caret overwrites on narrow terminals.
+                let t0 = std::time::Instant::now();
+                for i in 0..6 {
+                    print!(
+                        "\r{}",
+                        progress::spinner_line(
+                            theme,
+                            i,
+                            &format!("thinking {:.1}s", t0.elapsed().as_secs_f32())
+                        )
                     );
-                });
-                // Drain with caret effect: print deltas as they arrive.
-                let mut full = String::new();
-                print!("{}", theme.accent("▍"));
-                use std::io::Write;
-                for delta in rx {
-                    // Erase caret, print delta, reprint caret.
-                    print!("\r \r{delta}");
+                    use std::io::Write;
                     let _ = std::io::stdout().flush();
-                    full.push_str(&delta);
-                    let _ = &cancel;
+                    std::thread::sleep(std::time::Duration::from_millis(60));
                 }
-                println!();
-                if full.trim().is_empty() {
-                    full = answer.clone();
-                    print!("{full}");
-                    println!();
-                }
-                println!("{}", markdown::render_markdown(theme, &full));
+                print!("\r");
+                println!("{}", markdown::render_markdown(theme, &answer));
+                let full = answer;
                 if show_sources {
                     println!(
                         "{}",
@@ -271,7 +252,7 @@ async fn handle_slash(
                 aicli_ui::panel::render_panel(
                     theme,
                     "Commands",
-                    "/help /new [title] /sessions /open <id> /model [name] /ctx [n] /ctx compact\n/code <goal> /note <text> /note promote <turn> /memory /daily /budget /export [md|json]\n/temp [x] /sources /plain /clear /quit\nKeys: Ctrl+C stop  Ctrl+D exit  Ctrl+L clear  Ctrl+R history"
+                    "/help /new [title] /sessions /open <id> /model [id]\n/insert <file.gguf> [--name id] [--ctx n] /setting [set k v] /effort [level]\n/budget /compact /export [md|json] /sources /plain /clear /quit\nKeys: Ctrl+C stop  Ctrl+D exit  Ctrl+L clear  Ctrl+R history"
                 )
             );
             Ok(true)

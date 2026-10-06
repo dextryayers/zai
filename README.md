@@ -2,7 +2,7 @@
 
 Rust only CLI, single binary, local GGUF runtime, safe coding agent, daily capture, local RAG with citations.
 
-Status: v1.0.0. Phases 0 to 7 complete. Mock inference stream with real GGUF validate, budget, sessions, agent, daily, RAG. Real llama.cpp stream behind `llama` feature next.
+Status: v1.1.0. Bare `zai` opens the full screen TUI with sessions panel and `/` commands. Mock inference stream with real GGUF validate, budget, sessions, agent, daily, RAG. Real llama.cpp stream behind `llama` feature next.
 
 ## Install
 
@@ -17,8 +17,10 @@ zai doctor
 ## Quickstart
 
 ```bash
+zai                 # full screen UI: sessions left, chat main, / commands
 zai doctor
-zai models list
+zai models insert ~/models/tiny-q4_k_m.gguf --name tiny
+zai models set-default tiny
 zai index ./docs --rebuild
 zai ask "where is thread pool built" --index ./docs --show-sources
 zai code "fix failing test" --path ./crates/tools
@@ -32,7 +34,8 @@ Flags: `--profile`, `--plain`, `--json`, `--quiet`, `--offline`, `--verbose`.
 ## Commands
 
 ```text
-zai chat                        REPL with /help /code /note /memory /daily
+zai                           full screen UI, sessions left, / commands
+zai chat                      classic REPL with /help
 zai ask "<q>" --show-sources    cited answer, --no-rag to skip retrieval
 zai code "<goal>" --apply       12 step loop, atomic patch, allowlisted verify
 zai patch show|apply|drop       inspect pending diffs

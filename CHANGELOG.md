@@ -2,6 +2,16 @@
 All notable changes to this project will be documented in this file.
 Format follows Keep a Changelog. Versions follow SemVer.
 
+## [1.1.0] - 2026-10-06
+### Added
+- Full screen TUI on bare `zai`: left sessions panel with Tab focus plus Enter to open, main chat with styled markdown, slash completion popup, help plus models plus settings plus effort overlays, insert progress gauge, toasts, boot splash, thinking spinner with elapsed time, smooth styled streaming reveal
+- Slash core shared by TUI and REPL: /help /new /sessions /open /model /insert /setting /effort /budget /compact /export /sources /clear /plain /quit with typo hints and Tab completion
+- GGUF insert: `/insert <file.gguf> [--name id] [--ctx n]` and `zai models insert`, header validate plus sha256 plus progress, unlimited saved models in custom-models.toml, `models list` shows cached plus local plus active markers
+- Model switch: `/model` overlay picker plus `zai models set-default` now writes config, all commands resolve user models first
+- Settings page: `/setting` overlay plus `zai config set` keys model effort temp top_p seed ctx threads gpu_layers theme, validated writes via Config::save
+- Effort levels Default Low Medium High XHigh Expert with temp plus top_p plus token plus step mapping, in status bar, sampler, and agent step cap
+- Fixed classic REPL double render garble, AICLI header, swapped temp and seed display
+
 ## [1.0.0] - 2026-10-06
 ### Added
 - Phase 6 RAG: chunk 512 plus 64 overlap with line anchors, hash embed dim 128 offline, cache sqlite FTS5 plus vectors, meta rag-v1 plus config hash with rebuild guard, incremental by mtime, fusion 0.5 plus 0.5 with dedupe, citations path plus lines plus scores, eval 10 of 10 pass

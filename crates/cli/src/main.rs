@@ -1,6 +1,8 @@
 pub mod handlers;
 pub mod output;
 pub mod repl;
+pub mod slash;
+pub mod tui;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -186,10 +188,25 @@ pub enum PatchOp {
 #[derive(Subcommand, Debug)]
 pub enum ModelsOp {
     List,
-    Pull { id: String },
-    Verify { id: String },
-    Remove { id: String },
-    SetDefault { id: String },
+    Pull {
+        id: String,
+    },
+    Insert {
+        path: PathBuf,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        ctx: Option<u32>,
+    },
+    Verify {
+        id: String,
+    },
+    Remove {
+        id: String,
+    },
+    SetDefault {
+        id: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]

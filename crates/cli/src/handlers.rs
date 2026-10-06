@@ -5,10 +5,8 @@ use serde::Serialize;
 
 pub async fn dispatch(ctx: Ctx) -> anyhow::Result<()> {
     match &ctx.cli.cmd {
-        None => {
-            show_home(&ctx)?;
-            Ok(())
-        }
+        // Bare `zai` enters the full screen TUI. All actions use `/` commands inside.
+        None => crate::tui::launch(ctx),
         Some(Cmd::Chat {
             session,
             model,
@@ -92,74 +90,13 @@ pub async fn dispatch(ctx: Ctx) -> anyhow::Result<()> {
     }
 }
 
-fn show_home(ctx: &Ctx) -> anyhow::Result<()> {
-    let theme = &ctx.theme;
-    if ctx.is_json() {
-        #[derive(Serialize)]
-        struct Data {
-            product: String,
-            version: String,
-            model: String,
-            profile: String,
-        }
-        output::print_json(
-            true,
-            Data {
-                product: "zai".to_string(),
-                version: "1.0.0".to_string(),
-                model: ctx.config.model.default.clone(),
-                profile: ctx.paths.profile.clone(),
-            },
-        );
-        return Ok(());
-    }
-    println!(
-        "{}",
-        status::status_line(
-            theme,
-            "1.0.0",
-            &ctx.config.model.default,
-            0,
-            ctx.config.model.n_ctx,
-            true,
-            &ctx.paths.profile
-        )
-    );
-    for i in 0..4 {
-        print!(
-            "\r{}",
-            progress::spinner_line(theme, i, "warming up local workspace")
-        );
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    println!();
-    let tasks = aicli_core::store::task_list(&ctx.paths.data_dir, None);
-    let open = tasks.iter().filter(|t| !t.done).count();
-    // Session count from sqlite for Phase 3 home signal.
-    let sessions_open = open_db_sessions(ctx).map(|v| v.len()).unwrap_or(0);
-    let body = format!(
-        "chat   start daily chat      zai chat\ncode   fix from prompt       zai code \"fix failing test\"\ndaily  today overview        zai daily --today\nindex  search local files    zai index ./docs\n\ntasks open: {open}  sessions: {sessions_open}  profile: {}",
-        ctx.paths.profile
-    );
-    println!("{}", panel::render_panel(theme, "Quick actions", &body));
-    println!("{}", status::hint_line(theme));
-    Ok(())
-}
-
-fn open_db_sessions(ctx: &Ctx) -> anyhow::Result<Vec<aicli_core::sessions::Session>> {
-    let conn = aicli_core::db::open(&ctx.paths.db_file)?;
-    aicli_core::sessions::list_sessions(&conn, 50)
-}
-
 fn resolve_model(
     ctx: &Ctx,
     override_id: Option<String>,
 ) -> (String, Option<std::path::PathBuf>, bool) {
     let id = override_id.unwrap_or_else(|| ctx.config.model.default.clone());
-    let cached =
-        aicli_models::find_model(&id).map(|e| aicli_models::local_path(&ctx.paths.models_dir, &e));
+    let cached = aicli_models::find_any(&ctx.paths.models_dir, &id)
+        .map(|e| aicli_models::local_path(&ctx.paths.models_dir, &e));
     let exists = cached.as_ref().map(|p| p.exists()).unwrap_or(false);
     (id, cached, exists)
 }
@@ -171,10 +108,36 @@ fn sampler_for(
     mode: &str,
 ) -> aicli_infer::SamplerConfig {
     let seed = seed.unwrap_or(ctx.config.model.seed);
+    let (eff_temp, eff_top_p, _, _) = aicli_core::config::effort_profile(&ctx.config.model.effort)
+        .unwrap_or((0.6, 0.9, 1024, 12));
     match mode {
-        "code" => aicli_infer::SamplerConfig::code(temp.or(Some(ctx.config.model.temp_code)), seed),
-        _ => aicli_infer::SamplerConfig::chat(temp.or(Some(ctx.config.model.temp_chat)), seed),
+        "code" => aicli_infer::SamplerConfig {
+            temp: temp
+                .or(Some(ctx.config.model.temp_code))
+                .unwrap_or(eff_temp),
+            top_p: eff_top_p,
+            seed,
+            mode: "code".to_string(),
+        },
+        _ => aicli_infer::SamplerConfig {
+            temp: temp
+                .or(Some(ctx.config.model.temp_chat))
+                .unwrap_or(eff_temp),
+            top_p: eff_top_p,
+            seed,
+            mode: "chat".to_string(),
+        },
     }
+}
+
+/// Agent step cap is the smaller of user flag, config, and effort profile.
+fn step_cap(ctx: &Ctx, max_steps: u32) -> u32 {
+    let (_, _, _, effort_steps) = aicli_core::config::effort_profile(&ctx.config.model.effort)
+        .unwrap_or((0.6, 0.9, 1024, 12));
+    max_steps
+        .min(ctx.config.tools.max_steps)
+        .min(effort_steps)
+        .max(1)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -259,7 +222,7 @@ fn cmd_ask(
         }
     };
     let usage = aicli_infer::build_prompt(
-        "You are AICLI, a local assistant. Answer concisely. Use provided sources first and cite paths.",
+        "You are Zai, a local assistant. Answer concisely. Use provided sources first and cite paths.",
         &chunks,
         &history,
         query,
@@ -410,7 +373,7 @@ fn cmd_ask(
             "{}",
             status::status_line(
                 theme,
-                "1.0.0",
+                env!("CARGO_PKG_VERSION"),
                 &model_id,
                 usage.estimated_tokens as u32,
                 n_ctx,
@@ -478,7 +441,7 @@ fn cmd_code(
 ) -> anyhow::Result<()> {
     let theme = &ctx.theme;
     let sampler = sampler_for(ctx, temp, seed, "code");
-    let steps_cap = max_steps.min(ctx.config.tools.max_steps).max(1);
+    let steps_cap = step_cap(ctx, max_steps);
     let root = if path.is_file() {
         path.parent()
             .unwrap_or(std::path::Path::new("."))
@@ -1297,7 +1260,7 @@ fn cmd_models(ctx: &Ctx, op: &ModelsOp) -> anyhow::Result<()> {
     let theme = &ctx.theme;
     match op {
         ModelsOp::List => {
-            let reg = aicli_models::builtin_registry();
+            let reg = aicli_models::list_all(&ctx.paths.models_dir);
             if ctx.is_json() {
                 #[derive(Serialize)]
                 struct Row {
@@ -1306,6 +1269,7 @@ fn cmd_models(ctx: &Ctx, op: &ModelsOp) -> anyhow::Result<()> {
                     size_mb: u64,
                     n_ctx: u32,
                     cached: bool,
+                    local: bool,
                     path: String,
                 }
                 let rows: Vec<Row> = reg
@@ -1313,12 +1277,14 @@ fn cmd_models(ctx: &Ctx, op: &ModelsOp) -> anyhow::Result<()> {
                     .map(|m| {
                         let p = aicli_models::local_path(&ctx.paths.models_dir, &m);
                         let cached = p.exists();
+                        let local = m.repo == "local";
                         Row {
                             id: m.id,
                             quant: m.quant,
                             size_mb: m.size_mb,
                             n_ctx: m.n_ctx,
                             cached,
+                            local,
                             path: p.display().to_string(),
                         }
                     })
@@ -1331,11 +1297,14 @@ fn cmd_models(ctx: &Ctx, op: &ModelsOp) -> anyhow::Result<()> {
                 .map(|m| {
                     let p = aicli_models::local_path(&ctx.paths.models_dir, m);
                     let cached = if p.exists() { "cached" } else { "" };
-                    let status = if m.is_default {
-                        format!("default {cached}").trim().to_string()
+                    let mut status = if m.id == ctx.config.model.default {
+                        format!("active {cached}").trim().to_string()
                     } else {
                         cached.to_string()
                     };
+                    if m.repo == "local" {
+                        status = format!("{status} local").trim().to_string();
+                    }
                     vec![
                         m.id.clone(),
                         m.quant.clone(),
@@ -1432,8 +1401,52 @@ fn cmd_models(ctx: &Ctx, op: &ModelsOp) -> anyhow::Result<()> {
             }
             Ok(())
         }
+        ModelsOp::Insert {
+            path,
+            name,
+            ctx: n_ctx,
+        } => {
+            let src = if path.is_absolute() {
+                path.clone()
+            } else {
+                std::env::current_dir().unwrap_or_default().join(path)
+            };
+            println!("{}", theme.bold(&format!("insert {}", src.display())));
+            let entry = aicli_models::insert_gguf(
+                &ctx.paths.models_dir,
+                &src,
+                name.as_deref(),
+                *n_ctx,
+                |done, total| {
+                    if ctx.is_json() {
+                        return;
+                    }
+                    let done_mb = done as f64 / (1024.0 * 1024.0);
+                    let total_mb = total as f64 / (1024.0 * 1024.0);
+                    print!(
+                        "\r{}",
+                        aicli_ui::progress::download_line("insert", done_mb, total_mb, 0.0)
+                    );
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                },
+            )?;
+            println!();
+            if ctx.is_json() {
+                output::print_json(true, &entry);
+            } else {
+                println!(
+                    "{}",
+                    theme.ok(&format!(
+                        "saved {} ({} MB, ctx {}) - switch with: zai models set-default {}",
+                        entry.id, entry.size_mb, entry.n_ctx, entry.id
+                    ))
+                );
+            }
+            Ok(())
+        }
         ModelsOp::Verify { id } => {
-            let entry = aicli_models::find_model(id)
+            let entry = aicli_models::find_any(&ctx.paths.models_dir, id)
                 .ok_or_else(|| anyhow::anyhow!("unknown model {id}"))?;
             let p = aicli_models::local_path(&ctx.paths.models_dir, &entry);
             if !p.exists() {
@@ -1473,6 +1486,11 @@ fn cmd_models(ctx: &Ctx, op: &ModelsOp) -> anyhow::Result<()> {
             Ok(())
         }
         ModelsOp::Remove { id } => {
+            // User inserts are removed with registry entry, builtin only drops the file.
+            if aicli_models::remove_custom(&ctx.paths.models_dir, id)? {
+                println!("{}", theme.ok(&format!("removed {id}")));
+                return Ok(());
+            }
             let entry = aicli_models::find_model(id)
                 .ok_or_else(|| anyhow::anyhow!("unknown model {id}"))?;
             let p = aicli_models::local_path(&ctx.paths.models_dir, &entry);
@@ -1485,15 +1503,21 @@ fn cmd_models(ctx: &Ctx, op: &ModelsOp) -> anyhow::Result<()> {
             Ok(())
         }
         ModelsOp::SetDefault { id } => {
-            if aicli_models::find_model(id).is_none() {
+            if aicli_models::find_any(&ctx.paths.models_dir, id).is_none() {
                 anyhow::bail!("unknown model {id}");
             }
-            println!(
-                "{}",
-                theme.muted(&format!(
-                    "set-default {id}: edit config model.default, then: zai config show"
-                ))
-            );
+            let mut cfg = ctx.config.clone();
+            cfg.model.default = id.clone();
+            cfg.save(&ctx.paths.config_file)?;
+            if ctx.is_json() {
+                #[derive(Serialize)]
+                struct Data {
+                    id: String,
+                }
+                output::print_json(true, Data { id: id.clone() });
+            } else {
+                println!("{}", theme.ok(&format!("active model: {id}")));
+            }
             Ok(())
         }
     }
@@ -2088,34 +2112,72 @@ fn cmd_config(ctx: &Ctx, op: &crate::ConfigOp) -> anyhow::Result<()> {
             Ok(())
         }
         crate::ConfigOp::Set { key, value } => {
-            // Support model.default, model.n_ctx, ui.theme in Phase 3 writer.
+            // Short keys map to settings page rows. See /setting in TUI.
             let mut cfg = ctx.config.clone();
             let applied = match key.as_str() {
-                "model.default" => {
+                "model" | "model.default" => {
                     cfg.model.default = value.clone();
                     true
                 }
-                "model.n_ctx" => match value.parse::<u32>() {
+                "effort" | "model.effort" => {
+                    if aicli_core::config::effort_profile(value).is_none() {
+                        anyhow::bail!("effort must be Default Low Medium High XHigh Expert");
+                    }
+                    cfg.model.effort = value.clone();
+                    true
+                }
+                "temp" => match value.parse::<f32>() {
+                    Ok(n) => {
+                        cfg.model.temp_chat = n;
+                        true
+                    }
+                    Err(_) => false,
+                },
+                "top_p" => match value.parse::<f32>() {
+                    Ok(n) => {
+                        cfg.model.top_p = n;
+                        true
+                    }
+                    Err(_) => false,
+                },
+                "seed" => match value.parse::<u64>() {
+                    Ok(n) => {
+                        cfg.model.seed = n;
+                        true
+                    }
+                    Err(_) => false,
+                },
+                "ctx" | "model.n_ctx" => match value.parse::<u32>() {
                     Ok(n) => {
                         cfg.model.n_ctx = n;
                         true
                     }
                     Err(_) => false,
                 },
-                "ui.theme" => {
+                "threads" => match value.parse::<u32>() {
+                    Ok(n) => {
+                        cfg.model.n_threads = n;
+                        true
+                    }
+                    Err(_) => false,
+                },
+                "gpu_layers" => match value.parse::<u32>() {
+                    Ok(n) => {
+                        cfg.model.n_gpu_layers = n;
+                        true
+                    }
+                    Err(_) => false,
+                },
+                "theme" | "ui.theme" => {
                     cfg.ui.theme = value.clone();
                     true
                 }
                 _ => false,
             };
             if !applied {
-                anyhow::bail!("unknown key {key}, try model.default, model.n_ctx, ui.theme");
+                anyhow::bail!("unknown key {key}, keys: model effort temp top_p seed ctx threads gpu_layers theme");
             }
-            let text = toml::to_string_pretty(&cfg)?;
-            if let Some(parent) = ctx.paths.config_file.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&ctx.paths.config_file, text)?;
+            cfg.save(&ctx.paths.config_file)?;
             println!("{}", theme.ok(&format!("set {key}={value}")));
             Ok(())
         }
@@ -2156,10 +2218,11 @@ fn cmd_doctor(
             cache_mb: u64,
             data_mb: u64,
             model: String,
+            effort: String,
             n_ctx: u32,
             model_cached: bool,
         }
-        let entry = aicli_models::find_model(&ctx.config.model.default);
+        let entry = aicli_models::find_any(&ctx.paths.models_dir, &ctx.config.model.default);
         let cached = entry
             .as_ref()
             .map(|e| aicli_models::local_path(&ctx.paths.models_dir, e).exists())
@@ -2167,20 +2230,21 @@ fn cmd_doctor(
         output::print_json(
             true,
             Data {
-                version: "1.0.0".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
                 profile: ctx.paths.profile.clone(),
                 config_file: ctx.paths.config_file.display().to_string(),
                 data_dir: ctx.paths.data_dir.display().to_string(),
                 cache_mb,
                 data_mb,
                 model: ctx.config.model.default.clone(),
+                effort: ctx.config.model.effort.clone(),
                 n_ctx: ctx.config.model.n_ctx,
                 model_cached: cached,
             },
         );
         return Ok(());
     }
-    let entry = aicli_models::find_model(&ctx.config.model.default);
+    let entry = aicli_models::find_any(&ctx.paths.models_dir, &ctx.config.model.default);
     let cached = entry
         .as_ref()
         .map(|e| {
@@ -2200,6 +2264,7 @@ fn cmd_doctor(
         ],
         vec!["data".to_string(), ctx.paths.data_dir.display().to_string()],
         vec!["model".to_string(), ctx.config.model.default.clone()],
+        vec!["effort".to_string(), ctx.config.model.effort.clone()],
         vec!["model file".to_string(), cached],
         vec!["ctx".to_string(), format!("{}", ctx.config.model.n_ctx)],
         vec![
