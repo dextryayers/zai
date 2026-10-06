@@ -3,8 +3,8 @@
 ## Chat
 
 ```bash
-aicli chat
-aicli chat --session fix-1 --model qwen2.5-3b-instruct-q4_k_m
+zai chat
+zai chat --session fix-1 --model qwen2.5-3b-instruct-q4_k_m
 ```
 
 Inside REPL:
@@ -32,13 +32,13 @@ Keys: Ctrl+C stops stream, Ctrl+D exits, Up and Down recall history.
 ## Ask with RAG
 
 ```bash
-aicli index ./docs --rebuild
-aicli index ./docs --status
-aicli ask "where is thread pool built" --index ./docs --show-sources
-aicli ask "hello" --show-budget --top-k 5
-aicli ask "hello" --no-rag
-aicli ask "hello" --json | python3 -m json.tool
-aicli index --eval
+zai index ./docs --rebuild
+zai index ./docs --status
+zai ask "where is thread pool built" --index ./docs --show-sources
+zai ask "hello" --show-budget --top-k 5
+zai ask "hello" --no-rag
+zai ask "hello" --json | python3 -m json.tool
+zai index --eval
 ```
 
 Citations show `path:start-end score= bm25= vec=`. Stale index errors print rebuild fix.
@@ -46,28 +46,28 @@ Citations show `path:start-end score= bm25= vec=`. Stale index errors print rebu
 ## Code agent
 
 ```bash
-aicli code "fix failing test" --path ./crates/tools
-aicli code "add json flag" --path ./crates/cli --apply
-AICLI_AUTO_YES=1 aicli code "todo" --path /tmp/demo --apply --yes
-aicli patch show --patch-id p0001
-aicli patch apply --patch-id p0001 --yes
-aicli run -- git status
+zai code "fix failing test" --path ./crates/tools
+zai code "add json flag" --path ./crates/cli --apply
+ZAI_AUTO_YES=1 zai code "todo" --path /tmp/demo --apply --yes
+zai patch show --patch-id p0001
+zai patch apply --patch-id p0001 --yes
+zai run -- git status
 ```
 
-Dry run default. Apply writes backup `<file>.aicli.bak.<ts>`. Verify runs allowlisted fmt when Rust touched.
+Dry run default. Apply writes backup `<file>.zai.bak.<ts>`. Verify runs allowlisted fmt when Rust touched.
 
 ## Daily and memory
 
 ```bash
-aicli tasks add "write tests"
-aicli tasks list
-aicli tasks carry --from yesterday
-aicli notes add "shipped shell demo"
-aicli notes search "rust"
-aicli daily --today
-aicli daily --week
-aicli memory show
-aicli memory add "prefer tabs"
+zai tasks add "write tests"
+zai tasks list
+zai tasks carry --from yesterday
+zai notes add "shipped shell demo"
+zai notes search "rust"
+zai daily --today
+zai daily --week
+zai memory show
+zai memory add "prefer tabs"
 ```
 
 Week shows counts only, no invented narrative. Memory is user owned, model reads on ask when wired, never auto writes.
@@ -75,9 +75,9 @@ Week shows counts only, no invented narrative. Memory is user owned, model reads
 ## Models
 
 ```bash
-aicli models list
-aicli models pull qwen2.5-3b-instruct-q4_k_m
-aicli models verify qwen2.5-3b-instruct-q4_k_m
-aicli doctor
-aicli doctor --bench-load --bench-gen 64
+zai models list
+zai models pull qwen2.5-3b-instruct-q4_k_m
+zai models verify qwen2.5-3b-instruct-q4_k_m
+zai doctor
+zai doctor --bench-load --bench-gen 64
 ```

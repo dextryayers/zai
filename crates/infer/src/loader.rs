@@ -15,7 +15,7 @@ impl std::fmt::Display for InferError {
         match self {
             Self::ModelMissing(id) => write!(
                 f,
-                "E_MODEL_MISSING: {id} not found. Run: aicli models pull {id}"
+                "E_MODEL_MISSING: {id} not found. Run: zai models pull {id}"
             ),
             Self::CtxOverflow => write!(
                 f,

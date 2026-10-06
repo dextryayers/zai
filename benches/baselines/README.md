@@ -8,6 +8,6 @@ Reference target, not a promise. Measured on 4 core laptop with SSD.
 | ask with RAG top 5 | under 5 s cold | under 1 s warm cache |
 | notes search 200 rows | under 200 ms p95 | unit test asserts under 200 ms |
 | markdown fixture | under 50 ms each | unit golden, no panic on malformed fences |
-| startup no model | under 300 ms | `time aicli --help`, shell only |
+| startup no model | under 300 ms | `time zai --help`, shell only |
 
 Run `bash benches/bench.sh` for fresh numbers. Store new baselines here per release.

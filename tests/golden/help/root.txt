@@ -1,6 +1,6 @@
-Offline coding and daily assistant
+Zai AI offline coding and daily assistant
 
-Usage: aicli [OPTIONS] [COMMAND]
+Usage: zai [OPTIONS] [COMMAND]
 
 Commands:
   chat      Start or resume interactive chat

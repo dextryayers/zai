@@ -24,28 +24,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aicli"
-version = "1.0.0"
-dependencies = [
- "aicli-core",
- "aicli-infer",
- "aicli-ingest",
- "aicli-models",
- "aicli-rag",
- "aicli-tools",
- "aicli-ui",
- "anyhow",
- "clap",
- "rusqlite",
- "rustyline",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "toml",
-]
-
-[[package]]
 name = "aicli-core"
 version = "0.2.0"
 dependencies = [
@@ -2676,6 +2654,28 @@ dependencies = [
  "quote",
  "syn 3.0.6",
  "synstructure",
+]
+
+[[package]]
+name = "zai"
+version = "1.0.0"
+dependencies = [
+ "aicli-core",
+ "aicli-infer",
+ "aicli-ingest",
+ "aicli-models",
+ "aicli-rag",
+ "aicli-tools",
+ "aicli-ui",
+ "anyhow",
+ "clap",
+ "rusqlite",
+ "rustyline",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
 ]
 
 [[package]]

@@ -90,7 +90,7 @@ pub fn download_with_resume(url: &str, dest: &Path) -> Result<()> {
     }
     let have: u64 = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
     let client = reqwest::blocking::Client::builder()
-        .user_agent("aicli/0.2")
+        .user_agent("zai/1.0")
         .timeout(std::time::Duration::from_secs(120))
         .build()?;
 
@@ -170,7 +170,7 @@ pub fn pull(id: &str, models_dir: &Path) -> Result<PathBuf> {
     }
     let url = hf_url(&entry);
     download_with_resume(&url, &dest).with_context(|| {
-        format!("E_OFFLINE: pull failed for {id}. Check network then retry: aicli models pull {id}")
+        format!("E_OFFLINE: pull failed for {id}. Check network then retry: zai models pull {id}")
     })?;
     if !verify_sha256(&dest, entry.sha256.as_deref())? {
         let _ = std::fs::remove_file(&dest);

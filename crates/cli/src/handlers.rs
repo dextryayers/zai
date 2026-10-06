@@ -105,7 +105,7 @@ fn show_home(ctx: &Ctx) -> anyhow::Result<()> {
         output::print_json(
             true,
             Data {
-                product: "aicli".to_string(),
+                product: "zai".to_string(),
                 version: "1.0.0".to_string(),
                 model: ctx.config.model.default.clone(),
                 profile: ctx.paths.profile.clone(),
@@ -140,7 +140,7 @@ fn show_home(ctx: &Ctx) -> anyhow::Result<()> {
     // Session count from sqlite for Phase 3 home signal.
     let sessions_open = open_db_sessions(ctx).map(|v| v.len()).unwrap_or(0);
     let body = format!(
-        "chat   start daily chat      aicli chat\ncode   fix from prompt       aicli code \"fix failing test\"\ndaily  today overview        aicli daily --today\nindex  search local files    aicli index ./docs\n\ntasks open: {open}  sessions: {sessions_open}  profile: {}",
+        "chat   start daily chat      zai chat\ncode   fix from prompt       zai code \"fix failing test\"\ndaily  today overview        zai daily --today\nindex  search local files    zai index ./docs\n\ntasks open: {open}  sessions: {sessions_open}  profile: {}",
         ctx.paths.profile
     );
     println!("{}", panel::render_panel(theme, "Quick actions", &body));
@@ -322,7 +322,7 @@ fn cmd_ask(
             None => "mock backend".to_string(),
         }
     } else {
-        format!("mock backend, pull with: aicli models pull {model_id}")
+        format!("mock backend, pull with: zai models pull {model_id}")
     };
 
     let answer = aicli_infer::sampler::mock_answer_with_sampler(query, &sampler);
@@ -436,7 +436,7 @@ fn cmd_ask(
                 panel::render_panel(
                     theme,
                     "Sources",
-                    "no index hits, run: aicli index ./docs --rebuild"
+                    "no index hits, run: zai index ./docs --rebuild"
                 )
             );
         } else {
@@ -715,7 +715,7 @@ fn cmd_code(
             panel::render_panel(
                 theme,
                 "Applied",
-                &format!("{}\nbackup: <file>.aicli.bak.<ts>", touched.join("\n"))
+                &format!("{}\nbackup: <file>.zai.bak.<ts>", touched.join("\n"))
             )
         );
         println!(
@@ -819,21 +819,24 @@ fn draft_diff_for_goal(
             ctx_lines
         };
         return format!(
-            "--- a/{rel}\n+++ b/{rel}\n@@ -{n},1 +{n},2 @@\n {safe_ctx}\n+// aicli: {goal_short}\n",
+            "--- a/{rel}\n+++ b/{rel}\n@@ -{n},1 +{n},2 @@\n {safe_ctx}\n+// zai: {goal_short}\n",
             n = h.line_no,
             rel = rel,
             safe_ctx = safe_ctx,
             goal_short = goal.chars().take(80).collect::<String>(),
         );
     }
-    "--- a/aicli-note.md\n+++ b/aicli-note.md\n@@ -1,0 +1,2 @@\n+# aicli\n+// aicli: planned edit\n"
+    "--- a/zai-note.md\n+++ b/zai-note.md\n@@ -1,0 +1,2 @@\n+# zai\n+// zai: planned edit\n"
         .to_string()
 }
 
 fn read_line_prompt(theme: &aicli_ui::Theme, prompt: &str) -> anyhow::Result<String> {
     use std::io::Write;
     // Auto yes for tests and pipes.
-    if std::env::var("AICLI_AUTO_YES").is_ok() {
+    if std::env::var("ZAI_AUTO_YES")
+        .or_else(|_| std::env::var("AICLI_AUTO_YES"))
+        .is_ok()
+    {
         return Ok("a".to_string());
     }
     print!("{}", theme.accent(prompt));
@@ -1009,7 +1012,7 @@ fn cmd_run(ctx: &Ctx, cmd: &[String]) -> anyhow::Result<()> {
     let theme = &ctx.theme;
     let full = cmd.join(" ");
     if full.is_empty() {
-        anyhow::bail!("usage: aicli run -- <cmd...>");
+        anyhow::bail!("usage: zai run -- <cmd...>");
     }
     // Gate first for fast deny with exit 5.
     if let aicli_tools::GateDecision::Deny { reason, hint } = aicli_tools::check_shell(
@@ -1028,7 +1031,10 @@ fn cmd_run(ctx: &Ctx, cmd: &[String]) -> anyhow::Result<()> {
         std::process::exit(5);
     }
     // Confirm when required, unless auto yes env or JSON quiet automation.
-    let need_confirm = ctx.config.tools.confirm_shell && std::env::var("AICLI_AUTO_YES").is_err();
+    let auto_yes = std::env::var("ZAI_AUTO_YES")
+        .or_else(|_| std::env::var("AICLI_AUTO_YES"))
+        .is_ok();
+    let need_confirm = ctx.config.tools.confirm_shell && !auto_yes;
     if need_confirm && !ctx.is_json() {
         println!(
             "{}",
@@ -1279,7 +1285,7 @@ fn cmd_index(
             theme,
             "Index",
             &format!(
-                "version {} hash {}\ndir: {}\nask with: aicli ask \"query\" --index {} --show-sources",
+                "version {} hash {}\ndir: {}\nask with: zai ask \"query\" --index {} --show-sources",
                 rep.version, rep.config_hash, rep.dir, rep.root
             )
         )
@@ -1435,7 +1441,7 @@ fn cmd_models(ctx: &Ctx, op: &ModelsOp) -> anyhow::Result<()> {
                     output::print_json_error(
                         "E_MODEL_MISSING",
                         &format!("{id} not cached"),
-                        &format!("aicli models pull {id}"),
+                        &format!("zai models pull {id}"),
                     );
                 } else {
                     eprintln!(
@@ -1444,7 +1450,7 @@ fn cmd_models(ctx: &Ctx, op: &ModelsOp) -> anyhow::Result<()> {
                             theme,
                             "E_MODEL_MISSING",
                             &format!("{id} not cached"),
-                            &format!("aicli models pull {id}"),
+                            &format!("zai models pull {id}"),
                             None
                         )
                     );
@@ -1485,7 +1491,7 @@ fn cmd_models(ctx: &Ctx, op: &ModelsOp) -> anyhow::Result<()> {
             println!(
                 "{}",
                 theme.muted(&format!(
-                    "set-default {id}: edit config model.default, then: aicli config show"
+                    "set-default {id}: edit config model.default, then: zai config show"
                 ))
             );
             Ok(())
@@ -1606,16 +1612,16 @@ fn cmd_daily(
     }
     // Today view with memory hint and animated header.
     let mem_hint = if aicli_core::memory::memory_path(&ctx.paths.data_dir).exists() {
-        "memory: on, see: aicli memory show"
+        "memory: on, see: zai memory show"
     } else {
-        "memory: empty, add with: aicli memory add \"prefer tabs\""
+        "memory: empty, add with: zai memory add \"prefer tabs\""
     };
     let mut body = format!("open tasks: {}\n", open.len());
     for t in open.iter().take(10) {
         body.push_str(&format!("[ ] {} {}\n", t.id, t.text));
     }
     if today || (!today && !week) {
-        body.push_str("\nRun: aicli tasks add \"write tests\"");
+        body.push_str("\nRun: zai tasks add \"write tests\"");
         body.push_str(&format!("\n{mem_hint}"));
     }
     println!("{}", panel::render_panel(theme, "Daily", body.trim()));
@@ -1641,7 +1647,7 @@ fn cmd_tasks(ctx: &Ctx, op: &TasksOp) -> anyhow::Result<()> {
             } else if items.is_empty() {
                 println!(
                     "{}",
-                    theme.warn("No tasks yet. Run: aicli tasks add \"first task\"")
+                    theme.warn("No tasks yet. Run: zai tasks add \"first task\"")
                 );
             } else {
                 let rows: Vec<Vec<String>> = items
@@ -1930,7 +1936,7 @@ fn cmd_sessions(ctx: &Ctx, op: &SessionsOp) -> anyhow::Result<()> {
             } else if list.is_empty() {
                 println!(
                     "{}",
-                    panel::render_panel(theme, "Sessions", "No sessions yet. Run: aicli chat")
+                    panel::render_panel(theme, "Sessions", "No sessions yet. Run: zai chat")
                 );
             } else {
                 let rows: Vec<Vec<String>> = list
@@ -2182,7 +2188,7 @@ fn cmd_doctor(
             if p.exists() {
                 format!("yes {}", p.display())
             } else {
-                format!("no, run: aicli models pull {}", e.id)
+                format!("no, run: zai models pull {}", e.id)
             }
         })
         .unwrap_or_else(|| "unknown model id".to_string());

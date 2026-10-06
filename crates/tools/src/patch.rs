@@ -147,7 +147,7 @@ fn parse_range(s: &str) -> Result<(usize, usize)> {
 }
 
 /// Apply patch set atomically. All hunks must apply or zero files change.
-/// Returns touched paths. Creates `<file>.aicli.bak.<ts>` before write.
+/// Returns touched paths. Creates `<file>.zai.bak.<ts>` before write.
 pub fn apply_patch_set(root: &Path, diff: &str) -> Result<Vec<String>> {
     let files = parse_patch(diff, root)?;
     // Stage 1: compute new contents without touching disk.
@@ -165,13 +165,13 @@ pub fn apply_patch_set(root: &Path, diff: &str) -> Result<Vec<String>> {
     let mut touched = Vec::new();
     for (abs, new_text) in staged {
         if abs.exists() {
-            let bak = abs.with_extension(format!("aicli.bak.{ts}"));
+            let bak = abs.with_extension(format!("zai.bak.{ts}"));
             std::fs::copy(&abs, &bak)?;
         }
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let tmp = abs.with_extension(format!("aicli.tmp.{ts}"));
+        let tmp = abs.with_extension(format!("zai.tmp.{ts}"));
         std::fs::write(&tmp, &new_text)?;
         std::fs::rename(&tmp, &abs)?;
         touched.push(abs.to_string_lossy().to_string());

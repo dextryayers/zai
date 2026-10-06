@@ -24,10 +24,10 @@ Index: walk with gitignore, chunk 512 plus 64 overlap, hash embed dim 128, store
 
 ## Storage
 
-Profile `~/.local/share/aicli/profiles/default/db.sqlite` WAL: sessions, turns, tasks, notes, events, notes_fts.
+Profile `~/.local/share/zai/profiles/default/db.sqlite` WAL: sessions, turns, tasks, notes, events, notes_fts.
 Mirrors: `sessions/<id>.jsonl`, `patches/<id>.diff`, `memory.md`, `logs/`.
-Cache `~/.cache/aicli/models/*.gguf`, `~/.cache/aicli/index/<slug>/index.sqlite` plus `meta.json`.
-Config `~/.config/aicli/config.toml` with env plus flag precedence.
+Cache `~/.cache/zai/models/*.gguf`, `~/.cache/zai/index/<slug>/index.sqlite` plus `meta.json`.
+Config `~/.config/zai/config.toml` with env plus flag precedence.
 
 ## Decision log
 

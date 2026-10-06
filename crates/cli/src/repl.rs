@@ -95,7 +95,7 @@ pub async fn run_chat(
     let mut show_sources = false;
 
     loop {
-        let prompt = format!("{} ", theme.accent("aicli>"));
+        let prompt = format!("{} ", theme.accent("zai>"));
         let line = rl.readline(&prompt);
         match line {
             Ok(input) => {
@@ -372,7 +372,7 @@ async fn handle_slash(
             let goal = rest.join(" ");
             println!(
                 "{}",
-                theme.muted(&format!("code goal: {goal}  (run outside REPL for full apply: aicli code \"{goal}\" --apply)"))
+                theme.muted(&format!("code goal: {goal}  (run outside REPL for full apply: zai code \"{goal}\" --apply)"))
             );
             Ok(true)
         }
@@ -418,7 +418,7 @@ async fn handle_slash(
             println!(
                 "{}",
                 theme.muted(&format!(
-                    "today open tasks plus week notes {} total, run: aicli daily --today",
+                    "today open tasks plus week notes {} total, run: zai daily --today",
                     report.total_notes
                 ))
             );

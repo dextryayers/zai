@@ -2,7 +2,11 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// Full CLI config. Precedence: defaults < file < env AICLI_* < CLI flags.
+fn env_first(keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|k| std::env::var(k).ok())
+}
+
+/// Full CLI config. Precedence: defaults < file < env ZAI_* < CLI flags.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub profile: ProfileCfg,
@@ -131,22 +135,22 @@ impl Config {
     }
 
     fn apply_env(&mut self) {
-        if let Ok(v) = std::env::var("AICLI_MODEL") {
+        if let Some(v) = env_first(&["ZAI_MODEL", "AICLI_MODEL"]) {
             if !v.is_empty() {
                 self.model.default = v;
             }
         }
-        if let Ok(v) = std::env::var("AICLI_CTX") {
+        if let Some(v) = env_first(&["ZAI_CTX", "AICLI_CTX"]) {
             if let Ok(n) = v.parse::<u32>() {
                 self.model.n_ctx = n;
             }
         }
-        if let Ok(v) = std::env::var("AICLI_THEME") {
+        if let Some(v) = env_first(&["ZAI_THEME", "AICLI_THEME"]) {
             if !v.is_empty() {
                 self.ui.theme = v;
             }
         }
-        if let Ok(v) = std::env::var("AICLI_PROFILE") {
+        if let Some(v) = env_first(&["ZAI_PROFILE", "AICLI_PROFILE"]) {
             if !v.is_empty() {
                 self.profile.name = v;
             }

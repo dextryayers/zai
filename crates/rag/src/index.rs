@@ -49,7 +49,7 @@ pub fn build_index(
     if let Some(meta) = read_meta(&dir) {
         if meta.version != INDEX_VERSION || meta.config_hash != chash {
             anyhow::bail!(
-                "stale index: version {} hash {} differs from {} {}. Run: aicli index {} --rebuild",
+                "stale index: version {} hash {} differs from {} {}. Run: zai index {} --rebuild",
                 meta.version,
                 meta.config_hash,
                 INDEX_VERSION,
@@ -218,7 +218,7 @@ pub fn index_status_report(cache_dir: &Path, root: &Path) -> Result<String> {
             m.indexed_at
         )),
         None => Ok(format!(
-            "index: not built for {}. Run: aicli index {} --rebuild",
+            "index: not built for {}. Run: zai index {} --rebuild",
             root.display(),
             root.display()
         )),

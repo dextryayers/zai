@@ -19,8 +19,10 @@ pub struct ProfilePaths {
 
 impl ProfilePaths {
     pub fn new(profile: &str) -> Result<Self> {
-        // Test override: AICLI_TEST_HOME points to a temp dir.
-        if let Ok(test_home) = std::env::var("AICLI_TEST_HOME") {
+        // Test override: ZAI_TEST_HOME points to a temp dir (AICLI_TEST_HOME kept as fallback).
+        if let Ok(test_home) =
+            std::env::var("ZAI_TEST_HOME").or_else(|_| std::env::var("AICLI_TEST_HOME"))
+        {
             let base = PathBuf::from(test_home);
             let data_dir = base.join("profiles").join(profile);
             return Ok(Self {
@@ -59,9 +61,9 @@ impl ProfilePaths {
                     .unwrap_or_else(|| PathBuf::from("~/.cache"))
             });
 
-        let config_file = config_base.join("aicli").join("config.toml");
-        let data_dir = data_base.join("aicli").join("profiles").join(profile);
-        let cache_dir = cache_base.join("aicli");
+        let config_file = config_base.join("zai").join("config.toml");
+        let data_dir = data_base.join("zai").join("profiles").join(profile);
+        let cache_dir = cache_base.join("zai");
         Ok(Self {
             profile: profile.to_string(),
             config_file,
@@ -105,11 +107,12 @@ mod tests {
     #[test]
     fn test_home_override_is_hermetic() {
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("AICLI_TEST_HOME", tmp.path());
+        std::env::set_var("ZAI_TEST_HOME", tmp.path());
         let p = ProfilePaths::new("default").unwrap();
         assert!(p.db_file.starts_with(tmp.path()));
         p.ensure().unwrap();
         assert!(p.sessions_dir.is_dir());
+        std::env::remove_var("ZAI_TEST_HOME");
         std::env::remove_var("AICLI_TEST_HOME");
     }
 }

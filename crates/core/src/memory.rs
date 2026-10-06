@@ -9,7 +9,7 @@ pub fn memory_path(data_dir: &Path) -> std::path::PathBuf {
 pub fn memory_show(data_dir: &Path) -> String {
     let p = memory_path(data_dir);
     std::fs::read_to_string(&p).unwrap_or_else(|_| {
-        "# Memory\n\nNo entries yet. Use: aicli memory add \"prefer tabs\" \n".to_string()
+        "# Memory\n\nNo entries yet. Use: zai memory add \"prefer tabs\" \n".to_string()
     })
 }
 

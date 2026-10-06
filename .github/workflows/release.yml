@@ -19,12 +19,12 @@ jobs:
       - run: cargo test --workspace
       - run: bash scripts/check-no-emdash.sh
       - run: bash scripts/offline-test.sh
-      - run: cargo build --locked --release -p aicli
-      - run: tar -czf aicli-${{ matrix.os }}.tar.gz -C target/release aicli
-      - run: sha256sum aicli-${{ matrix.os }}.tar.gz > aicli-${{ matrix.os }}.tar.gz.sha256
+      - run: cargo build --locked --release -p zai
+      - run: tar -czf zai-${{ matrix.os }}.tar.gz -C target/release zai
+      - run: sha256sum zai-${{ matrix.os }}.tar.gz > zai-${{ matrix.os }}.tar.gz.sha256
       - uses: actions/upload-artifact@v4
         with:
-          name: aicli-${{ matrix.os }}
+          name: zai-${{ matrix.os }}
           path: |
-            aicli-${{ matrix.os }}.tar.gz
-            aicli-${{ matrix.os }}.tar.gz.sha256
+            zai-${{ matrix.os }}.tar.gz
+            zai-${{ matrix.os }}.tar.gz.sha256

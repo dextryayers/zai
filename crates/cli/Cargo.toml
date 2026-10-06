@@ -1,12 +1,12 @@
 [package]
-name = "aicli"
+name = "zai"
 version = "1.0.0"
 edition = "2021"
-description = "AICLI offline coding and daily assistant"
-default-run = "aicli"
+description = "Zai AI offline coding and daily assistant"
+default-run = "zai"
 
 [[bin]]
-name = "aicli"
+name = "zai"
 path = "src/main.rs"
 
 [dependencies]

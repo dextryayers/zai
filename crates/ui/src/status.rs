@@ -20,7 +20,7 @@ pub fn status_line(
     };
     format!(
         "{} {} | model {} | {} | {} | {}",
-        theme.bold("aicli"),
+        theme.bold("zai"),
         theme.muted(version),
         theme.accent(&model_short),
         ctx_colored,

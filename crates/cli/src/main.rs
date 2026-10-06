@@ -7,7 +7,11 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "aicli", version, about = "Offline coding and daily assistant")]
+#[command(
+    name = "zai",
+    version,
+    about = "Zai AI offline coding and daily assistant"
+)]
 pub struct Cli {
     #[arg(long, default_value = "default")]
     pub profile: String,

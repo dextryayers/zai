@@ -13,7 +13,7 @@ Format follows Keep a Changelog. Versions follow SemVer.
 ### Added
 - Phase 4 agent: fs.read 200 lines plus 64 KB cap, fs.list 500 sorted, sandbox deny .. plus secret redact, git status plus diff 200 KB cap, events JSONL plus sqlite log
 - Phase 4 patch: parse plus validate plus atomic apply with backup .aicli.bak.ts, temp plus rename, hunk context check, word diff preview, patch show plus apply --yes plus drop
-- Phase 4 shell: allowlist prefix plus denylist wins, curl pipe to sh denied, 60s timeout, 4000 preview plus full run.log, approval prompt with 3s countdown, AICLI_AUTO_YES for automation
+- Phase 4 shell: allowlist prefix plus denylist wins, curl pipe to sh denied, 60s timeout, 4000 preview plus full run.log, approval prompt with 3s countdown, ZAI_AUTO_YES for automation
 - Phase 4 loop: 12 step cap, plan checklist ok plus pending, grounded diff from search hits, patch file pNNNN.diff, apply prompt a plus r plus t, verify fmt when Rust touched
 - Phase 5 daily: tasks carry yesterday to today, tasks clear done with --yes, week table open plus done plus notes plus load bar, top 5 terms counts only
 - Phase 5 memory: memory.md user owned, memory show plus add plus promote with preview, REPL /note plus /memory plus /daily plus /code shortcuts

@@ -11,7 +11,7 @@ pub fn check_shell(cmd: &str, allowlist: &[String], denylist: &[String]) -> Gate
         if c.contains(d.as_str()) {
             return GateDecision::Deny {
                 reason: format!("matched denylist entry `{d}`"),
-                hint: "choose an allowlisted command, see: aicli run --help".to_string(),
+                hint: "choose an allowlisted command, see: zai run --help".to_string(),
             };
         }
     }
