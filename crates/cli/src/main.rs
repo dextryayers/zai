@@ -105,6 +105,12 @@ pub enum Cmd {
     Run {
         #[arg(last = true)]
         cmd: Vec<String>,
+        /// Skip the approval prompt (still gated by shell mode + denylist).
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+        /// Run with full output (no 4000-char preview truncation in JSON).
+        #[arg(long, default_value_t = false)]
+        full: bool,
     },
     /// Index a folder for RAG
     Index {

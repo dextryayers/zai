@@ -35,6 +35,7 @@ pub fn progress_bar(pct: f64, width: usize) -> String {
 }
 
 /// Live download line with speed and ETA, single row, no wrap.
+/// Premium: block bar + aligned columns, still contains "pct" for tests.
 pub fn download_line(label: &str, done_mb: f64, total_mb: f64, speed_mbs: f64) -> String {
     let pct = if total_mb > 0.0 {
         done_mb / total_mb * 100.0
@@ -47,11 +48,16 @@ pub fn download_line(label: &str, done_mb: f64, total_mb: f64, speed_mbs: f64) -
         0
     };
     format!(
-        "{label} ... {done_mb:.1}/{total_mb:.1} MB | {speed_mbs:.1} MB/s | {:02}:{:02} | {}",
+        "{label} ▓ {done_mb:.1}/{total_mb:.1} MB │ {speed_mbs:.1} MB/s │ ETA {:02}:{:02} │ {}",
         eta_s / 60,
         eta_s % 60,
         progress_bar(pct, 20)
     )
+}
+
+/// Premium step line: "● 2/5 drafting diff".
+pub fn step_line(current: usize, total: usize, msg: &str) -> String {
+    format!("● {current}/{total} {msg}")
 }
 
 /// Stream text with typewriter pacing to stdout. Used for mock demo and

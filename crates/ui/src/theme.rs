@@ -168,6 +168,111 @@ impl Theme {
         }
         nu_ansi_term::Style::new().bold().paint(s).to_string()
     }
+
+    /// Premium brand badge: cyan ZAI block, stable width, no wrap.
+    pub fn brand(&self) -> String {
+        if !self.color {
+            return "ZAI".to_string();
+        }
+        Color::Black
+            .on(Color::Cyan)
+            .bold()
+            .paint(" ZAI ")
+            .to_string()
+    }
+
+    /// Professional section title with rule: "── Title ──...".
+    pub fn section(&self, title: &str) -> String {
+        let w = self
+            .width
+            .min(100)
+            .saturating_sub(title.len() + 6)
+            .clamp(8, 80);
+        let rule: String = std::iter::repeat_n(if self.unicode { '─' } else { '-' }, w).collect();
+        format!(
+            "{} {} {}",
+            self.muted(&rule),
+            self.bold(title),
+            self.muted(&rule)
+        )
+    }
+
+    /// Compact context meter bar: 10 cells, color shifts at 60/85 pct.
+    /// Example: "[####------] 1840/4096 (44 pct)".
+    pub fn ctx_bar(&self, used: usize, total: u32) -> String {
+        let total = total.max(1) as usize;
+        let pct = (used * 100 / total).min(999);
+        let fill = (pct.min(100) * 10 / 100).clamp(0, 10);
+        let bar: String = (0..10)
+            .map(|i| {
+                if i < fill {
+                    if self.unicode {
+                        '█'
+                    } else {
+                        '#'
+                    }
+                } else if self.unicode {
+                    '░'
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let label = format!("[{bar}] {used}/{total} ({pct} pct)");
+        self.ctx_style(pct, &label)
+    }
+
+    /// One-line professional header for non-TUI commands.
+    pub fn header_line(&self, version: &str, model: &str, profile: &str) -> String {
+        format!(
+            "{} {} {} {}",
+            self.brand(),
+            self.muted(&format!("v{version}")),
+            self.accent(&truncate_left(model, 30)),
+            self.muted(&format!("· {profile} · offline"))
+        )
+    }
+
+    /// Gradient logo lines for welcome banners. Cyan to magenta top-bottom.
+    pub fn logo(&self, art: &[&str]) -> String {
+        if !self.color {
+            return art.join("\n");
+        }
+        let shades = [
+            Color::Cyan,
+            Color::LightBlue,
+            Color::Blue,
+            Color::Purple,
+            Color::Magenta,
+        ];
+        art.iter()
+            .enumerate()
+            .map(|(i, line)| shades[i % shades.len()].bold().paint(*line).to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Success with check mark, warning with triangle, error with cross.
+    /// Keeps plain fallback identical text without glyphs shifting tests.
+    pub fn success(&self, s: &str) -> String {
+        self.ok(&format!("✓ {s}"))
+    }
+
+    pub fn failure(&self, s: &str) -> String {
+        self.danger(&format!("✗ {s}"))
+    }
+}
+
+fn truncate_left(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    format!(
+        "...{}",
+        s.chars()
+            .skip(s.chars().count() - (max - 3))
+            .collect::<String>()
+    )
 }
 
 pub fn terminal_width() -> usize {

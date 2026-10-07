@@ -27,10 +27,20 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 
 log "building release from $REPO_DIR..."
-(cd "$REPO_DIR" && cargo build --locked --release -p zai)
-BIN="$REPO_DIR/target/release/zai"
+# Robust build: default target first, fallback to a temp target when the
+# repo target is polluted by root-owned files (old sudo builds).
+if ! (cd "$REPO_DIR" && cargo build --locked --release -p zai); then
+  log "default target failed, retrying with temp target..."
+  FALLBACK_DIR="${TMPDIR:-/tmp}/zai-build-$USER"
+  mkdir -p "$FALLBACK_DIR"
+  (cd "$REPO_DIR" && CARGO_TARGET_DIR="$FALLBACK_DIR" cargo build --locked --release -p zai)
+  BIN="$FALLBACK_DIR/release/zai"
+else
+  BIN="$REPO_DIR/target/release/zai"
+fi
 if [ ! -x "$BIN" ]; then
   echo "error: build produced no binary at $BIN" >&2
+  echo "hint: sudo chown -R \$USER \"$REPO_DIR/target\" then rerun ./install.sh" >&2
   exit 1
 fi
 

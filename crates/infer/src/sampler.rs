@@ -64,8 +64,9 @@ pub fn random_seed() -> u64 {
 
 /// Deterministic mock answer. Same input plus same sampler gives byte identical output.
 /// Used for repro test and for offline demo before real llama backend.
-/// Never emits code blocks or source citations: those only come from real
-/// retrieval and real model output, so chat history stays clean.
+/// English-only product language. Never emits code blocks or source
+/// citations: those only come from real retrieval and real model output,
+/// so chat history stays clean.
 pub fn mock_answer_with_sampler(query: &str, sampler: &SamplerConfig) -> String {
     let short = truncate_query(query, 500);
     if query.trim().is_empty() {

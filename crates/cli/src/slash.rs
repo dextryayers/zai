@@ -3,6 +3,7 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Slash {
     Help,
+    Whoami,
     New(Option<String>),
     Sessions,
     Open(String),
@@ -20,6 +21,12 @@ pub enum Slash {
         arg: Option<String>,
     },
     Run(String),
+    Shell(String),
+    Code(String),
+    Ask(String),
+    Daily,
+    Task(String),
+    Note(String),
     Setting {
         key: Option<String>,
         value: Option<String>,
@@ -50,6 +57,11 @@ pub const SLASHES: &[SlashMeta] = &[
         usage: "/help",
     },
     SlashMeta {
+        name: "/whoami",
+        desc: "Who is Zai + developer",
+        usage: "/whoami",
+    },
+    SlashMeta {
         name: "/new",
         desc: "Start a new session",
         usage: "/new [title]",
@@ -58,6 +70,36 @@ pub const SLASHES: &[SlashMeta] = &[
         name: "/new-chat",
         desc: "Start a new chat session",
         usage: "/new-chat [title]",
+    },
+    SlashMeta {
+        name: "/ask",
+        desc: "Full answer: code, daily, terminal, security",
+        usage: "/ask <pertanyaan>",
+    },
+    SlashMeta {
+        name: "/code",
+        desc: "Full coding: runnable code + patch plan",
+        usage: "/code <tujuan>",
+    },
+    SlashMeta {
+        name: "/shell",
+        desc: "Full terminal access under shell gate",
+        usage: "/shell <cmd>",
+    },
+    SlashMeta {
+        name: "/daily",
+        desc: "Today overview: tasks + notes",
+        usage: "/daily",
+    },
+    SlashMeta {
+        name: "/task",
+        desc: "Quick task add",
+        usage: "/task <teks>",
+    },
+    SlashMeta {
+        name: "/note",
+        desc: "Quick note add or promote",
+        usage: "/note <teks> | /note promote <turn-id>",
     },
     SlashMeta {
         name: "/sessions",
@@ -203,6 +245,17 @@ pub fn parse(input: &str) -> Option<Slash> {
     let head = parts.remove(0);
     match head.as_str() {
         "/help" => Some(Slash::Help),
+        "/whoami" => Some(Slash::Whoami),
+        "/ask" => Some(Slash::Ask(parts.join(" "))),
+        "/code" => Some(Slash::Code(parts.join(" "))),
+        "/shell" => Some(Slash::Shell(parts.join(" "))),
+        "/daily" => Some(Slash::Daily),
+        "/task" => Some(Slash::Task(parts.join(" "))),
+        "/note" if parts.first().map(|s| s.as_str()) == Some("promote") => {
+            Some(Slash::Note(parts.join(" ")))
+        }
+        "/note" if !parts.is_empty() => Some(Slash::Note(parts.join(" "))),
+        "/note" => Some(Slash::Note(String::new())),
         "/new" => Some(Slash::New(if parts.is_empty() {
             None
         } else {

@@ -1,4 +1,5 @@
 pub mod markdown;
+pub mod pager;
 pub mod panel;
 pub mod progress;
 pub mod status;

@@ -65,7 +65,7 @@ pub async fn dispatch(ctx: Ctx) -> anyhow::Result<()> {
             *yes,
         ),
         Some(Cmd::Patch { op }) => cmd_patch(&ctx, op),
-        Some(Cmd::Run { cmd }) => cmd_run(&ctx, cmd),
+        Some(Cmd::Run { cmd, yes, full }) => cmd_run(&ctx, cmd, *yes, *full),
         Some(Cmd::Index {
             path,
             rebuild,
@@ -238,13 +238,7 @@ fn cmd_ask(
             ),
         }
     };
-    let usage = aicli_infer::build_prompt(
-        "You are Zai, a local assistant. Answer concisely. Use provided sources first and cite paths.",
-        &chunks,
-        &history,
-        query,
-        n_ctx,
-    );
+    let usage = aicli_infer::build_prompt(aicli_infer::ZAI_SYSTEM, &chunks, &history, query, n_ctx);
 
     if usage.overflow {
         eprintln!(
@@ -294,7 +288,7 @@ fn cmd_ask(
         );
     }
     let parts = crate::answer::AskParts {
-        system: "You are Zai, a local assistant. Answer concisely. Use provided sources first and cite paths.",
+        system: aicli_infer::ZAI_SYSTEM,
         chunks: &chunks,
         history: &history,
     };
@@ -415,7 +409,16 @@ fn cmd_ask(
     }
     aicli_infer::sampler::stream_mock_to_stdout(&answer, ctx.config.ui.stream_flush_ms)?;
     println!();
-    println!("{}", markdown::render_markdown(theme, &answer));
+    let rendered = markdown::render_markdown(theme, &answer);
+    if rendered.lines().count() > 40 && !ctx.is_json() {
+        println!(
+            "{}",
+            theme.muted("output panjang - scroll less (j/k, q keluar)")
+        );
+        aicli_ui::pager::page_or_print(theme, &rendered);
+    } else {
+        println!("{rendered}");
+    }
     if show_sources {
         if retrieved.is_empty() {
             println!(
@@ -812,8 +815,23 @@ fn draft_diff_for_goal(
     goal: &str,
     hits: &[aicli_tools::SearchHit],
 ) -> String {
-    // Grounded template: touch first hit file when available, else create note file.
-    // Keeps hunks valid by reading real context lines.
+    // Pro agent: three paths, all hunks validated against real files.
+    // 1. Explicit new file request ("buat file X", "create file X").
+    if let Some(new_rel) = parse_new_file_request(goal) {
+        let body = codegen_body_for_goal(goal);
+        return new_file_diff(&new_rel, &body);
+    }
+    // 2. Full codegen when the goal is a coding request: create a
+    //    goal-scoped file so the user always gets runnable code, even
+    //    when search found nothing relevant.
+    if aicli_infer::brain::codegen::is_coding_request(goal) && hits.is_empty() {
+        let lang = aicli_infer::brain::codegen::detect_target_lang(goal);
+        let rel = default_codegen_path(lang, goal);
+        let body = codegen_body_for_goal(goal);
+        return new_file_diff(&rel, &body);
+    }
+    // 3. Grounded edit: touch first hit file with real context lines plus
+    //    a codegen snippet, so the diff is more than a comment.
     if let Some(h) = hits.first() {
         let rel = pathdiff_rel(root, &std::path::PathBuf::from(&h.file));
         let ctx_lines = aicli_tools::fs_read(root, &rel, h.line_no, h.line_no)
@@ -824,16 +842,149 @@ fn draft_diff_for_goal(
         } else {
             ctx_lines
         };
+        let goal_short: String = goal.chars().take(80).collect();
+        // One real code line from codegen when available, else a marker.
+        let snippet = codegen_one_liner(goal);
         return format!(
-            "--- a/{rel}\n+++ b/{rel}\n@@ -{n},1 +{n},2 @@\n {safe_ctx}\n+// zai: {goal_short}\n",
+            "--- a/{rel}\n+++ b/{rel}\n@@ -{n},1 +{n},3 @@\n {safe_ctx}\n+// zai goal: {goal_short}\n+{snippet}\n",
             n = h.line_no,
             rel = rel,
             safe_ctx = safe_ctx,
-            goal_short = goal.chars().take(80).collect::<String>(),
+            goal_short = goal_short,
+            snippet = snippet,
         );
     }
-    "--- a/zai-note.md\n+++ b/zai-note.md\n@@ -1,0 +1,2 @@\n+# zai\n+// zai: planned edit\n"
-        .to_string()
+    // Fallback: professional note file with next steps.
+    let body = format!("# zai plan\n\nGoal: {goal}\n\nNo matching files. Next: `zai index . --rebuild` lalu `zai ask` untuk konteks.\n");
+    new_file_diff("zai-note.md", &body)
+}
+
+/// Parse "buat file foo.py" / "create file src/x.rs" into a relative path.
+fn parse_new_file_request(goal: &str) -> Option<String> {
+    let low = goal.to_lowercase();
+    for marker in ["buat file ", "bikin file ", "create file ", "new file "] {
+        if let Some(idx) = low.find(marker) {
+            let raw = goal[idx + marker.len()..]
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches(|c| c == '"' || c == '\'' || c == '`' || c == ',' || c == '.');
+            if raw.is_empty() {
+                return None;
+            }
+            // Sanitize: no absolute, no parent escape.
+            let clean = raw.trim_start_matches("./").trim_start_matches('/');
+            if clean.contains("..") || clean.is_empty() {
+                return None;
+            }
+            return Some(clean.to_string());
+        }
+    }
+    None
+}
+
+fn default_codegen_path(lang: &str, goal: &str) -> String {
+    // Deterministic slug so repeated goals map to the same file.
+    let mut slug: String = goal
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == ' ')
+        .collect();
+    slug = slug
+        .split_whitespace()
+        .take(4)
+        .collect::<Vec<_>>()
+        .join("-");
+    if slug.is_empty() {
+        slug = "solution".to_string();
+    }
+    let ext = match lang {
+        "rust" => "rs",
+        "python" => "py",
+        "javascript" => "js",
+        "typescript" => "ts",
+        "go" => "go",
+        "bash" => "sh",
+        "sql" => "sql",
+        _ => "py",
+    };
+    // Rust goes to src/ to match cargo layout, others to cwd root.
+    if lang == "rust" {
+        format!("src/zai-{slug}.{ext}")
+    } else {
+        format!("zai-{slug}.{ext}")
+    }
+}
+
+/// Full file body for a coding goal: codegen answer stripped to code when
+/// possible, else the whole professional answer.
+fn codegen_body_for_goal(goal: &str) -> String {
+    let full = aicli_infer::brain::codegen::generate(goal);
+    if let Some(code) = extract_first_fence(&full) {
+        return code;
+    }
+    full
+}
+
+/// One real code line for grounded edits: first non-empty code line of
+/// the codegen output, prefixed as a comment-safe addition.
+fn codegen_one_liner(goal: &str) -> String {
+    let full = aicli_infer::brain::codegen::generate(goal);
+    if let Some(code) = extract_first_fence(&full) {
+        if let Some(line) = code.lines().map(str::trim).find(|l| !l.is_empty()) {
+            // Keep diff valid for any language: prefix with + and keep raw.
+            return format!("+{line}");
+        }
+    }
+    format!("+// zai: {}", goal.chars().take(60).collect::<String>())
+}
+
+fn extract_first_fence(md: &str) -> Option<String> {
+    let mut in_fence = false;
+    let mut buf = String::new();
+    for line in md.lines() {
+        if line.trim_start().starts_with("```") {
+            if !in_fence {
+                in_fence = true;
+                continue;
+            } else {
+                if !buf.trim().is_empty() {
+                    return Some(buf.trim().to_string());
+                }
+                in_fence = false;
+                buf.clear();
+                continue;
+            }
+        }
+        if in_fence {
+            buf.push_str(line);
+            buf.push('\n');
+        }
+    }
+    if !buf.trim().is_empty() {
+        Some(buf.trim().to_string())
+    } else {
+        None
+    }
+}
+
+/// Unified diff that creates a new file (old /dev/null style via 0,0 hunk).
+fn new_file_diff(rel: &str, body: &str) -> String {
+    // Use a/ + b/ headers for parser compat. Empty old file reads as "".
+    let mut out = format!(
+        "--- a/{rel}\n+++ b/{rel}\n@@ -0,0 +1,{} @@\n",
+        body.lines().count().max(1)
+    );
+    for line in body.lines() {
+        out.push('+');
+        out.push_str(line);
+        out.push('\n');
+    }
+    // Ensure trailing newline hunk stays valid.
+    if !body.ends_with('\n') {
+        out.push('\n');
+    }
+    out
 }
 
 fn read_line_prompt(theme: &aicli_ui::Theme, prompt: &str) -> anyhow::Result<String> {
@@ -1014,11 +1165,11 @@ fn apply_with_root_fallback(root: &std::path::Path, diff: &str) -> anyhow::Resul
     Err(last_err)
 }
 
-fn cmd_run(ctx: &Ctx, cmd: &[String]) -> anyhow::Result<()> {
+fn cmd_run(ctx: &Ctx, cmd: &[String], yes: bool, full_out: bool) -> anyhow::Result<()> {
     let theme = &ctx.theme;
     let full = cmd.join(" ");
     if full.is_empty() {
-        anyhow::bail!("usage: zai run -- <cmd...>");
+        anyhow::bail!("usage: zai run -- <cmd...> [--yes]");
     }
     // Gate first for fast deny with exit 5.
     if let aicli_tools::GateDecision::Deny { reason, hint } = aicli_tools::check_shell_full(
@@ -1039,18 +1190,21 @@ fn cmd_run(ctx: &Ctx, cmd: &[String]) -> anyhow::Result<()> {
     }
     // Confirm when required, unless auto yes env or JSON quiet automation.
     // Full access mode skips the prompt but always logs the command.
+    // Professional: --yes skips the prompt for one shot, shell allow skips all.
     let auto_yes = std::env::var("ZAI_AUTO_YES")
         .or_else(|_| std::env::var("AICLI_AUTO_YES"))
-        .is_ok();
+        .is_ok()
+        || yes;
     let need_confirm =
         ctx.config.tools.shell_mode != "allow" && ctx.config.tools.confirm_shell && !auto_yes;
     if need_confirm && !ctx.is_json() {
         println!(
             "{}",
-            panel::render_panel(
+            panel::render_panel_with_action(
                 theme,
                 "Run approval",
-                &format!("cmd: {full}\nAllowlisted. Type yes to run, Ctrl+C aborts.")
+                "allowlisted",
+                &format!("cmd: {full}\nType yes to run, Ctrl+C aborts.\nTip: `zai run --yes -- {full}` skips this once, `zai config set shell allow` enables full terminal access.")
             )
         );
         // Elegant 3s countdown display before prompt.
@@ -1072,10 +1226,10 @@ fn cmd_run(ctx: &Ctx, cmd: &[String]) -> anyhow::Result<()> {
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let logp = ctx.paths.logs_dir.join("run.log");
-    if ctx.config.tools.shell_mode == "allow" && !ctx.is_json() {
+    if ctx.config.tools.shell_mode == "allow" && !ctx.is_json() && !ctx.is_quiet() {
         println!(
             "{}",
-            theme.warn("full terminal access mode, running without prompt")
+            theme.muted("● full terminal access - running without prompt, logged to run.log")
         );
     }
     match aicli_tools::run_blocking(
@@ -1100,17 +1254,28 @@ fn cmd_run(ctx: &Ctx, cmd: &[String]) -> anyhow::Result<()> {
                     cmd: String,
                     exit: i32,
                     preview: String,
+                    full: String,
                 }
                 output::print_json(
                     true,
                     Data {
-                        cmd: full,
+                        cmd: full.clone(),
                         exit: code,
-                        preview,
+                        preview: preview.clone(),
+                        full: if full_out {
+                            full_text.clone()
+                        } else {
+                            preview.clone()
+                        },
                     },
                 );
             } else {
-                println!("{preview}");
+                // --full prints the complete log, else the 4000-char preview.
+                if full_out {
+                    println!("{full_text}");
+                } else {
+                    println!("{preview}");
+                }
                 let _ = full_text;
                 if code != 0 {
                     std::process::exit(code);

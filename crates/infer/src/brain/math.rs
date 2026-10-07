@@ -255,19 +255,39 @@ fn is_date_or_version(s: &str) -> bool {
 /// Returns the expression when the whole trimmed remainder parses as math.
 pub fn extract_expr(query: &str) -> Option<String> {
     let mut q = query.trim().to_string();
-    // Strip trigger words in Indonesian and English.
+    // Strip trigger words in Indonesian and English. Longest first so
+    // "calculate" wins over "calc" and "how much is" wins over "how much".
+    // Requires a word boundary after the prefix so "calculate" does not
+    // match inside other words.
     for prefix in [
-        "hitung",
-        "berapa",
-        "kalkulasi",
-        "calc",
+        "how much is",
+        "result of",
         "calculate",
+        "kalkulasi",
+        "how much",
+        "what is",
         "compute",
+        "berapa",
+        "hitung",
+        "what's",
+        "whats",
+        "solve",
+        "calc",
         "eval",
         "math",
     ] {
-        if let Some(rest) = q.strip_prefix(prefix) {
-            let rest = rest.trim_start_matches([':', '=', ' ']).trim();
+        let low = q.to_lowercase();
+        if let Some(rest_raw) = low.strip_prefix(prefix) {
+            // Boundary: end, space, colon, equals.
+            if !(rest_raw.is_empty()
+                || rest_raw.starts_with(' ')
+                || rest_raw.starts_with(':')
+                || rest_raw.starts_with('='))
+            {
+                continue;
+            }
+            // Slice original query by byte length (ASCII prefixes, safe).
+            let rest = q[prefix.len()..].trim_start_matches([':', '=', ' ']).trim();
             if !rest.is_empty() {
                 q = rest.to_string();
                 break;
@@ -330,6 +350,12 @@ mod tests {
             extract_expr("berapa (10-2)/4?").as_deref(),
             Some("(10-2)/4")
         );
+        assert_eq!(extract_expr("what is 2+2?").as_deref(), Some("2+2"));
+        assert_eq!(
+            extract_expr("How much is (10-2)/4?").as_deref(),
+            Some("(10-2)/4")
+        );
+        assert_eq!(extract_expr("what is rust borrow checker"), None);
         assert_eq!(extract_expr("2026-10-06"), None);
         assert_eq!(extract_expr("1.1.0"), None);
         assert_eq!(extract_expr("hello world"), None);

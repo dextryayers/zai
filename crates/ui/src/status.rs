@@ -1,6 +1,7 @@
 use crate::theme::Theme;
 
 /// Status line, always one row, never wraps. Truncates model id from left.
+/// Premium layout: brand + version + model + ctx bar + offline + profile.
 pub fn status_line(
     theme: &Theme,
     version: &str,
@@ -10,28 +11,29 @@ pub fn status_line(
     offline: bool,
     profile: &str,
 ) -> String {
-    let net = if offline { "offline" } else { "online" };
-    let model_short = truncate_left(model, 28);
-    let ctx = format!("ctx {ctx_used}/{ctx_total}");
-    let ctx_colored = if ctx_total > 0 && ctx_used * 100 / ctx_total.max(1) >= 85 {
-        theme.warn(&ctx)
+    let net = if offline { "● offline" } else { "○ online" };
+    let net_styled = if offline {
+        theme.ok(net)
     } else {
-        theme.muted(&ctx)
+        theme.warn(net)
     };
+    let model_short = truncate_left(model, 28);
+    // Compact bar keeps the line to one row on 80 cols.
+    let bar = theme.ctx_bar(ctx_used as usize, ctx_total);
     format!(
         "{} {} | model {} | {} | {} | {}",
-        theme.bold("zai"),
-        theme.muted(version),
+        theme.brand(),
+        theme.muted(&format!("v{version}")),
         theme.accent(&model_short),
-        ctx_colored,
-        theme.muted(net),
+        bar,
+        net_styled,
         theme.muted(profile)
     )
 }
 
 pub fn hint_line(theme: &Theme) -> String {
     theme
-        .muted("/help commands  |  Tab complete  |  Ctrl+C stop  |  Ctrl+D exit  |  F2 palette")
+        .muted("❯ type + Enter  |  /help commands  |  Tab complete  |  Ctrl+C stop  |  Ctrl+D exit  |  /whoami")
         .to_string()
 }
 

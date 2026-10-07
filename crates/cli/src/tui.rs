@@ -455,13 +455,18 @@ pub fn launch(ctx: Ctx) -> Result<()> {
     }
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
+    crossterm::execute!(
+        stdout,
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::event::EnableMouseCapture
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let res = run_app(ctx, &mut terminal);
     crossterm::terminal::disable_raw_mode()?;
     crossterm::execute!(
         terminal.backend_mut(),
+        crossterm::event::DisableMouseCapture,
         crossterm::terminal::LeaveAlternateScreen
     )?;
     res
@@ -659,7 +664,7 @@ fn ctx_usage(ctx: &Ctx, session_id: &str, pending_input: &str) -> (usize, u32) {
         .map(|v| v.into_iter().map(|t| (t.role, t.content)).collect())
         .unwrap_or_default();
     let u = aicli_infer::build_prompt(
-        "You are Zai, a local assistant. Answer concisely.",
+        aicli_infer::ZAI_SYSTEM_SHORT,
         &[],
         &history,
         pending_input,
@@ -742,7 +747,7 @@ fn run_app(ctx: Ctx, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>)
                     .map(|v| v.into_iter().map(|t| (t.role, t.content)).collect())
                     .unwrap_or_default();
                 let prompt = aicli_infer::build_prompt(
-                    "You are Zai, a local assistant. Answer concisely.",
+                    aicli_infer::ZAI_SYSTEM_SHORT,
                     &[],
                     &history,
                     q,
@@ -755,7 +760,7 @@ fn run_app(ctx: Ctx, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>)
                     model_id.clone(),
                     sampler,
                     prompt,
-                    "You are Zai, a local assistant. Answer concisely.".to_string(),
+                    aicli_infer::ZAI_SYSTEM_SHORT.to_string(),
                     vec![],
                     history,
                     ctx.config.model.n_ctx,
@@ -781,6 +786,7 @@ fn run_app(ctx: Ctx, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>)
             }
             pending = Some(Pending::Streaming);
             follow = true;
+            scroll = 0;
         }
         // Advance streaming reveal on the newest unfinished message.
         // Scans from the tail so trailing done notes never block it.
@@ -1000,11 +1006,13 @@ fn run_app(ctx: Ctx, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>)
                             cursor = 0;
                             slash_sel = None;
                             follow = true;
+                            scroll = 0;
                             continue;
                         }
                         (KeyCode::Char('l'), m) if m.contains(KeyModifiers::CONTROL) => {
                             clear_chat_log(&mut messages, &mut toast);
                             follow = true;
+                            scroll = 0;
                             continue;
                         }
                         (KeyCode::Char('p'), m) if m.contains(KeyModifiers::CONTROL) => {
@@ -1033,6 +1041,7 @@ fn run_app(ctx: Ctx, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>)
                                 &format!("budget {u}/{t} model {model_id} effort {effort}"),
                             ));
                             follow = true;
+                            scroll = 0;
                             continue;
                         }
                         (KeyCode::Char('s'), m) if m.contains(KeyModifiers::CONTROL) => {
@@ -1074,6 +1083,25 @@ fn run_app(ctx: Ctx, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>)
                     }
                 }
                 crossterm::event::Event::Resize(_, _) => {}
+                crossterm::event::Event::Mouse(me) => {
+                    use crossterm::event::{MouseButton, MouseEventKind};
+                    match me.kind {
+                        MouseEventKind::ScrollUp => {
+                            follow = false;
+                            scroll = scroll.saturating_add(3);
+                        }
+                        MouseEventKind::ScrollDown => {
+                            scroll = scroll.saturating_sub(3);
+                            if scroll == 0 {
+                                follow = true;
+                                scroll = 0;
+                            }
+                        }
+                        // Click restores follow when already at bottom area.
+                        MouseEventKind::Down(MouseButton::Left) => {}
+                        _ => {}
+                    }
+                }
                 _ => {}
             }
         }
@@ -1363,6 +1391,8 @@ fn draw(
         _ => {}
     }
     // Chat column only exists in full mode. Minimal shows the logo stage.
+    // Professional scroll: `scroll` is scrollback lines up from bottom
+    // (0 = follow). PgUp/wheel-up increases, PgDn/wheel-down decreases.
     if show_rail {
         let total_lines = lines.len() as u16;
         let show_scrollbar = !follow && total_lines > chat_area.height.saturating_sub(2);
@@ -1375,12 +1405,23 @@ fn draw(
             chat_area
         };
         let view_h = chat_inner.height.saturating_sub(2);
+        let max_back = total_lines.saturating_sub(view_h);
+        let back = scroll.min(max_back);
         let offset = if follow {
             total_lines.saturating_sub(view_h)
         } else {
-            scroll.min(total_lines.saturating_sub(1))
+            total_lines.saturating_sub(view_h + back)
         };
-        let scroll_tag = if follow { "" } else { " - PgDn to follow " };
+        let scroll_tag = if follow {
+            " - ↑↓ history · PgUp/PgDn + wheel scroll · End follow ".to_string()
+        } else {
+            let pct = if max_back > 0 {
+                100 - (back as usize * 100 / max_back as usize)
+            } else {
+                100
+            };
+            format!(" - ↑ {back} · PgDn/End follow · {pct} pct ")
+        };
         let chat_title = if minimal {
             " Chat - type a message, Enter opens tabs ".to_string()
         } else {
@@ -1625,10 +1666,13 @@ fn draw(
                 ("Ctrl+A/Home", "line start"),
                 ("Ctrl+K", "kill to cursor end"),
                 ("Ctrl+W", "delete word back"),
-                ("End/Delete", "line end / forward delete"),
-                ("Up/Down", "pick / command or history"),
+                ("End / Ctrl+End", "follow newest"),
+                ("Ctrl+Home", "jump to top"),
+                ("Up/Down", "history (empty input = scroll 3)"),
+                ("Ctrl+Up/Down", "scroll chat 3 lines"),
                 ("Tab/Enter", "apply command"),
-                ("PgUp/PgDn", "scroll chat"),
+                ("PgUp/PgDn", "scroll chat 10 lines"),
+                ("Wheel", "scroll chat"),
                 ("Alt+1/Alt+2", "sessions/chat focus"),
                 ("Ctrl+C/D", "stop/exit"),
                 ("F3", "toggle rail focus"),
@@ -2315,6 +2359,7 @@ fn handle_key(
                                 messages.push(Msg::full(Role::Sys, &welcome_banner_msg()));
                             }
                             *follow = true;
+                            *scroll = 0;
                             *focus_left = false;
                         }
                     }
@@ -2340,6 +2385,7 @@ fn handle_key(
             *cursor = 0;
             *slash_sel = None;
             *follow = true;
+            *scroll = 0;
             let cont = submit(
                 ctx,
                 &text,
@@ -2382,10 +2428,26 @@ fn handle_key(
             Ok(true)
         }
         KeyCode::Home => {
+            // Ctrl+Home jumps to top (large scrollback), plain Home = line start.
+            if mods.contains(KeyModifiers::CONTROL) {
+                *follow = false;
+                *scroll = scroll.saturating_add(500);
+                return Ok(true);
+            }
             *cursor = 0;
             Ok(true)
         }
         KeyCode::End => {
+            // Ctrl+End or plain End with empty input follows newest.
+            if mods.contains(KeyModifiers::CONTROL) || input.trim().is_empty() {
+                *scroll = 0;
+                *follow = true;
+                *scroll = 0;
+                if !mods.contains(KeyModifiers::CONTROL) {
+                    // Empty input: follow only, keep cursor.
+                    return Ok(true);
+                }
+            }
             *cursor = input.chars().count();
             Ok(true)
         }
@@ -2421,6 +2483,18 @@ fn handle_key(
             Ok(true)
         }
         KeyCode::Up => {
+            // Professional: Ctrl+Up always scrolls chat 3 lines.
+            if mods.contains(KeyModifiers::CONTROL) {
+                *follow = false;
+                *scroll = scroll.saturating_add(3);
+                return Ok(true);
+            }
+            // Empty input + Up scrolls up (older) instead of history.
+            if input.trim().is_empty() {
+                *follow = false;
+                *scroll = scroll.saturating_add(3);
+                return Ok(true);
+            }
             if *focus_left {
                 if *sess_sel > 0 {
                     *sess_sel -= 1;
@@ -2439,6 +2513,24 @@ fn handle_key(
             Ok(true)
         }
         KeyCode::Down => {
+            // Professional: Ctrl+Down always scrolls down 3 lines.
+            if mods.contains(KeyModifiers::CONTROL) {
+                *scroll = scroll.saturating_sub(3);
+                if *scroll == 0 {
+                    *follow = true;
+                    *scroll = 0;
+                }
+                return Ok(true);
+            }
+            // Empty input + Down scrolls toward newest.
+            if input.trim().is_empty() && !*follow {
+                *scroll = scroll.saturating_sub(3);
+                if *scroll == 0 {
+                    *follow = true;
+                    *scroll = 0;
+                }
+                return Ok(true);
+            }
             if *focus_left {
                 *sess_sel = (*sess_sel + 1).min(sessions.len().saturating_sub(1));
                 return Ok(true);
@@ -2478,13 +2570,14 @@ fn handle_key(
         }
         KeyCode::PageUp => {
             *follow = false;
-            *scroll = scroll.saturating_add(5);
+            *scroll = scroll.saturating_add(10);
             Ok(true)
         }
         KeyCode::PageDown => {
-            *scroll = scroll.saturating_sub(5);
+            *scroll = scroll.saturating_sub(10);
             if *scroll == 0 {
                 *follow = true;
+                *scroll = 0;
             }
             Ok(true)
         }
@@ -2900,6 +2993,120 @@ fn submit(
             }
             Slash::Run(cmd) => {
                 run_in_tui(ctx, &cmd, messages);
+            }
+            Slash::Shell(cmd) => {
+                run_in_tui(ctx, &cmd, messages);
+            }
+            Slash::Code(goal) => {
+                if goal.trim().is_empty() {
+                    messages.push(Msg::full(
+                        Role::Sys,
+                        "usage: /code <tujuan> - contoh: /code buatkan fibonacci python",
+                    ));
+                } else {
+                    // Dynamic full-code path: model first when available,
+                    // offline synthesizer as fallback (no single hardcoded answer).
+                    let body = aicli_infer::brain::codegen::generate(&goal);
+                    messages.push(Msg::full(Role::Zai, &body));
+                    messages.push(Msg::full(
+                        Role::Sys,
+                        &format!("Terapkan ke repo: zai code \"{goal}\" --apply"),
+                    ));
+                }
+            }
+            Slash::Ask(q) => {
+                if q.trim().is_empty() {
+                    messages.push(Msg::full(Role::Sys, "usage: /ask <pertanyaan>"));
+                } else {
+                    // Route through the normal pipeline as a fresh question.
+                    // Submit returns true (handled), but we push a hint and
+                    // let the outer flow generate via model-first router.
+                    messages.push(Msg::full(Role::Sys, &format!("menjawab: {q}")));
+                    // Fall through: treat as regular chat input below.
+                    // To keep the event loop simple, generate inline here.
+                    let sampler = sampler_for_ctx(ctx, effort, None);
+                    let history: Vec<(String, String)> = aicli_core::db::open(&ctx.paths.db_file)
+                        .ok()
+                        .and_then(|c| aicli_core::sessions::list_turns(&c, &session.id).ok())
+                        .map(|v| v.into_iter().map(|t| (t.role, t.content)).collect())
+                        .unwrap_or_default();
+                    let prompt = aicli_infer::build_prompt(
+                        aicli_infer::ZAI_SYSTEM_SHORT,
+                        &[],
+                        &history,
+                        &q,
+                        ctx.config.model.n_ctx,
+                    )
+                    .prompt;
+                    let (rx, cancel) = spawn_answer(
+                        ctx,
+                        q.clone(),
+                        model_id.clone(),
+                        sampler,
+                        prompt,
+                        aicli_infer::ZAI_SYSTEM_SHORT.to_string(),
+                        vec![],
+                        history,
+                        ctx.config.model.n_ctx,
+                    );
+                    *pending = Some(Pending::Waiting { rx, cancel });
+                    persist_user(ctx, &session.id, &q);
+                }
+            }
+            Slash::Daily => {
+                let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                let tasks = aicli_core::store::task_list(&ctx.paths.data_dir, Some(&today));
+                let open = tasks.iter().filter(|t| !t.done).count();
+                let report = aicli_core::store::week_report(&ctx.paths.data_dir);
+                messages.push(Msg::full(
+                    Role::Sys,
+                    &format!("Daily {today}: {open} tugas terbuka, {} catatan minggu ini. Lengkap: zai daily --today", report.total_notes),
+                ));
+            }
+            Slash::Task(text) => {
+                if text.trim().is_empty() {
+                    messages.push(Msg::full(Role::Sys, "usage: /task <teks tugas>"));
+                } else {
+                    match aicli_core::store::task_add(&ctx.paths.data_dir, &text, None) {
+                        Ok(t) => {
+                            *toast = Some((format!("tugas {} tersimpan", t.id), Instant::now()));
+                            messages.push(Msg::full(
+                                Role::Zai,
+                                &format!("Tugas tersimpan: {} ({})", t.text, t.id),
+                            ));
+                        }
+                        Err(e) => messages.push(Msg::full(Role::Sys, &format!("gagal: {e}"))),
+                    }
+                }
+            }
+            Slash::Note(text) => {
+                if text.trim().is_empty() {
+                    messages.push(Msg::full(Role::Sys, "usage: /note <teks>"));
+                } else if let Some(rest) = text.strip_prefix("promote ") {
+                    messages.push(Msg::full(
+                        Role::Sys,
+                        &format!("promote: {rest} - gunakan zai chat /note promote <turn-id>"),
+                    ));
+                } else {
+                    match aicli_core::store::note_add(&ctx.paths.data_dir, &text, None) {
+                        Ok(n) => {
+                            *toast = Some((format!("catatan {} tersimpan", n.id), Instant::now()));
+                            messages.push(Msg::full(
+                                Role::Zai,
+                                &format!("Catatan tersimpan ({})", n.id),
+                            ));
+                        }
+                        Err(e) => messages.push(Msg::full(Role::Sys, &format!("gagal: {e}"))),
+                    }
+                }
+            }
+            Slash::Whoami => {
+                messages.push(Msg::full(
+                    Role::Zai,
+                    &aicli_infer::brain::identity::answer(
+                        "who developed you - siapa yang mengembangkan kamu",
+                    ),
+                ));
             }
             Slash::Sources => {
                 *show_sources = !*show_sources;

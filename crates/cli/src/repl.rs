@@ -32,11 +32,23 @@ fn print_welcome_repl(theme: &aicli_ui::theme::Theme) {
             theme.width.min(100)
         )
     );
+    // Professional identity + capability bar. Single source: Hanif Abdurrohim.
+    println!(
+        "{}",
+        theme.center_pad(
+            "Saya Zai oleh Hanif Abdurrohim - full coding, daily, terminal, defensive security",
+            theme.width.min(100)
+        )
+    );
     println!(
         "{}",
         theme.muted(
-            "Type a message or / for commands - /new-chat starts fresh - /clear wipes the view"
+            "Type a message or / for commands - /whoami shows identity - /code builds full programs - /shell runs terminal"
         )
+    );
+    println!(
+        "{}",
+        theme.muted("Quick: /ask <q> full answer - /daily today - /task <t> - /note <n> - /run <cmd> - /help all")
     );
     println!(
         "{}",
@@ -226,7 +238,7 @@ pub async fn run_chat(
                     .map(|t| (t.role.clone(), t.content.clone()))
                     .collect();
                 let usage = aicli_infer::build_prompt(
-                    "You are Zai, a local assistant. Answer concisely.",
+                    aicli_infer::ZAI_SYSTEM_SHORT,
                     &[],
                     &hist,
                     &input,
@@ -279,7 +291,7 @@ pub async fn run_chat(
                         ))
                     );
                     let parts = crate::answer::AskParts {
-                        system: "You are Zai, a local assistant. Answer concisely.",
+                        system: aicli_infer::ZAI_SYSTEM_SHORT,
                         chunks: &[],
                         history: &hist,
                     };
@@ -309,10 +321,22 @@ pub async fn run_chat(
                 );
 
                 // Single clean render, no fake spinner: generation above
-                // already took the real time.
+                // already took the real time. Long answers page with less
+                // (j/k scroll, q quit) so classic REPL scrolls professionally.
                 print!("\r");
                 println!("{}", theme.muted("────────────────"));
-                println!("{}", markdown::render_markdown(theme, &answer));
+                let rendered = markdown::render_markdown(theme, &answer);
+                if rendered.lines().count() > 40 {
+                    println!(
+                        "{}",
+                        theme.muted(
+                            "output panjang - scroll dengan less (j/k, PgUp/PgDn, q keluar)"
+                        )
+                    );
+                    aicli_ui::pager::page_or_print(theme, &rendered);
+                } else {
+                    println!("{rendered}");
+                }
                 println!("{}", theme.muted("────────────────"));
                 let full = answer;
 
@@ -380,16 +404,124 @@ async fn handle_slash(
         ["/help"] => {
             println!(
                 "{}",
-                aicli_ui::panel::render_panel(
+                aicli_ui::panel::render_panel_with_action(
                     theme,
                     "Commands",
-                    "/help /new [title] /new-chat [title] /sessions /open <id> /model [id]\n/manage /ollama <list|pull|rm|show> /insert <file.gguf> [more...] /history [n] /setting [set k v] /effort [level]\n/budget /compact /export [md|json] /sources /plain /clear /quit\nKeys: Up/Down history - Tab completes / - Ctrl+A/E line - Ctrl+U clear line - Ctrl+L clear - Ctrl+R history - Ctrl+C stop - Ctrl+D exit"
+                    "professional",
+                    "/whoami identity - /ask <q> full answer - /code <tujuan> full program\n/new [title] - /sessions - /open <id> - /model [id] - /insert <file.gguf>\n/shell <cmd> - /run <cmd> - /daily - /task <t> - /note <teks>\n/manage - /ollama <list|pull|rm|show> - /history [n] - /setting [set k v] - /effort [level]\n/budget - /compact - /export [md|json] - /sources - /clear - /quit\nKeys: Up/Down history - Tab completes / - Ctrl+A/E line - Ctrl+U clear - Ctrl+L clear - Ctrl+R history - Ctrl+C stop - Ctrl+D exit"
                 )
             );
             println!(
                 "{}",
-                theme.muted("Tip: type / then press Tab to see all commands with hints.")
+                theme.muted(
+                    "Tip: type / then press Tab to see all commands with hints. Try /whoami."
+                )
             );
+            Ok(true)
+        }
+        ["/whoami"] => {
+            let ans = aicli_infer::brain::identity::answer(
+                "who developed you - siapa yang mengembangkan kamu",
+            );
+            println!("{}", aicli_ui::markdown::render_markdown(theme, &ans));
+            Ok(true)
+        }
+        ["/ask", rest @ ..] => {
+            if rest.is_empty() {
+                println!(
+                    "{}",
+                    theme.muted(
+                        "usage: /ask <pertanyaan> - full answer coding/daily/terminal/security"
+                    )
+                );
+                return Ok(true);
+            }
+            // Fall through to normal generation: reuse brain + model path by
+            // returning false so the main loop answers it as a chat turn.
+            // But show a professional prefix so REPL feels instant.
+            Ok(false)
+        }
+        ["/code", rest @ ..] => {
+            if rest.is_empty() {
+                println!(
+                    "{}",
+                    theme.muted("usage: /code <tujuan>  (contoh: /code buatkan fibonacci python)")
+                );
+                return Ok(true);
+            }
+            let goal = rest.join(" ");
+            // Instant offline full-code answer, no model wait.
+            let full = aicli_infer::brain::codegen::generate(&goal);
+            println!("{}", aicli_ui::markdown::render_markdown(theme, &full));
+            println!(
+                "{}",
+                theme.muted(&format!("Terapkan ke repo: zai code \"{goal}\" --apply  (dry-run dulu, apply butuh konfirmasi)"))
+            );
+            Ok(true)
+        }
+        ["/shell", rest @ ..] | ["/run", rest @ ..] => {
+            let full = rest.join(" ").trim().to_string();
+            if full.is_empty() {
+                println!(
+                    "{}",
+                    theme.muted("usage: /shell <cmd>  - contoh: /shell git status")
+                );
+                return Ok(true);
+            }
+            match aicli_tools::check_shell_full(
+                &full,
+                shell_mode,
+                &ctx.config.tools.shell_allowlist,
+                &ctx.config.tools.shell_denylist,
+            ) {
+                aicli_tools::GateDecision::Deny { reason, hint } => {
+                    println!("{}", theme.danger(&format!("ditolak: {reason}. {hint}")));
+                    println!(
+                        "{}",
+                        theme.muted("Aktifkan akses penuh: /setting set shell allow")
+                    );
+                    return Ok(true);
+                }
+                aicli_tools::GateDecision::Allow => {}
+            }
+            let auto_yes = std::env::var("ZAI_AUTO_YES")
+                .or_else(|_| std::env::var("AICLI_AUTO_YES"))
+                .is_ok();
+            if shell_mode != "allow" && ctx.config.tools.confirm_shell && !auto_yes {
+                use std::io::Write;
+                print!("jalankan `{full}`? [yes/no]> ");
+                let _ = std::io::stdout().flush();
+                let mut ans = String::new();
+                std::io::stdin().read_line(&mut ans)?;
+                if ans.trim().to_lowercase() != "yes" {
+                    println!("{}", theme.warn("dibatalkan, tidak ada yang dijalankan"));
+                    return Ok(true);
+                }
+            }
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            match aicli_tools::run_blocking(
+                &full,
+                &cwd,
+                shell_mode,
+                &ctx.config.tools.shell_allowlist,
+                &ctx.config.tools.shell_denylist,
+                std::time::Duration::from_secs(60),
+                Some(&ctx.paths.logs_dir.join("run.log")),
+            ) {
+                Ok((preview, _, code)) => {
+                    let _ = aicli_tools::log_event(
+                        &ctx.paths.data_dir,
+                        "shell.run",
+                        Some(session_id),
+                        &format!("cmd={full} exit={code}"),
+                    );
+                    println!("{preview}");
+                    if code != 0 {
+                        println!("{}", theme.warn(&format!("exit {code}")));
+                    }
+                }
+                Err(e) => println!("{}", theme.danger(&format!("gagal: {e}"))),
+            }
             Ok(true)
         }
         ["/quit"] | ["/exit"] => std::process::exit(0),
@@ -722,21 +854,7 @@ async fn handle_slash(
             }
             Ok(true)
         }
-        ["/code", rest @ ..] => {
-            if rest.is_empty() {
-                println!(
-                    "{}",
-                    theme.muted("usage: /code <goal>  (dry-run plan plus diff preview)")
-                );
-                return Ok(true);
-            }
-            let goal = rest.join(" ");
-            println!(
-                "{}",
-                theme.muted(&format!("code goal: {goal}  (run outside REPL for full apply: zai code \"{goal}\" --apply)"))
-            );
-            Ok(true)
-        }
+        // NOTE: /code full handled in premium block above (instant codegen).
         ["/note", "promote", turn_id] => {
             let turns = aicli_core::sessions::list_turns(conn, session_id).unwrap_or_default();
             if let Some(t) = turns.iter().find(|t| t.id == *turn_id) {
@@ -879,73 +997,42 @@ async fn handle_slash(
             println!("{}", theme.muted(&format!("ollama daemon {up}")));
             Ok(true)
         }
-        ["/run", rest @ ..] => {
-            let full = rest.join(" ").trim().to_string();
-            if full.is_empty() {
-                println!("{}", theme.muted("usage: /run <cmd>"));
-                return Ok(true);
-            }
-            match aicli_tools::check_shell_full(
-                &full,
-                shell_mode,
-                &ctx.config.tools.shell_allowlist,
-                &ctx.config.tools.shell_denylist,
-            ) {
-                aicli_tools::GateDecision::Deny { reason, hint } => {
-                    println!("{}", theme.danger(&format!("denied: {reason}. {hint}")));
-                    return Ok(true);
-                }
-                aicli_tools::GateDecision::Allow => {}
-            }
-            let auto_yes = std::env::var("ZAI_AUTO_YES")
-                .or_else(|_| std::env::var("AICLI_AUTO_YES"))
-                .is_ok();
-            if shell_mode != "allow" && ctx.config.tools.confirm_shell && !auto_yes {
-                use std::io::Write;
-                print!("run `{full}`? [yes/no]> ");
-                let _ = std::io::stdout().flush();
-                let mut ans = String::new();
-                std::io::stdin().read_line(&mut ans)?;
-                if ans.trim().to_lowercase() != "yes" {
-                    println!("{}", theme.warn("aborted, nothing ran"));
-                    return Ok(true);
-                }
-            }
-            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            match aicli_tools::run_blocking(
-                &full,
-                &cwd,
-                shell_mode,
-                &ctx.config.tools.shell_allowlist,
-                &ctx.config.tools.shell_denylist,
-                std::time::Duration::from_secs(60),
-                Some(&ctx.paths.logs_dir.join("run.log")),
-            ) {
-                Ok((preview, _, code)) => {
-                    let _ = aicli_tools::log_event(
-                        &ctx.paths.data_dir,
-                        "shell.run",
-                        Some(session_id),
-                        &format!("cmd={full} exit={code}"),
-                    );
-                    println!("{preview}");
-                    if code != 0 {
-                        println!("{}", theme.warn(&format!("exit {code}")));
-                    }
-                }
-                Err(e) => println!("{}", theme.danger(&format!("run failed: {e}"))),
-            }
-            Ok(true)
-        }
+        // NOTE: /run + /shell handled in the premium block above (line ~441).
         ["/daily"] => {
+            let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+            let tasks = aicli_core::store::task_list(&ctx.paths.data_dir, Some(&today));
+            let open: Vec<_> = tasks.iter().filter(|t| !t.done).collect();
             let report = aicli_core::store::week_report(&ctx.paths.data_dir);
+            let mut body = format!("Tanggal: {today}  Tugas terbuka: {}\n", open.len());
+            for t in open.iter().take(8) {
+                body.push_str(&format!("[ ] {} ({})\n", t.text, t.id));
+            }
+            if open.is_empty() {
+                body.push_str("[ ] belum ada tugas hari ini - tambah: /task <teks>\n");
+            }
+            body.push_str(&format!(
+                "\nCatatan minggu ini: {} total. Lengkap: zai daily --today",
+                report.total_notes
+            ));
             println!(
                 "{}",
-                theme.muted(&format!(
-                    "today open tasks plus week notes {} total, run: zai daily --today",
-                    report.total_notes
-                ))
+                aicli_ui::panel::render_panel_with_action(theme, "Daily", "today", body.trim())
             );
+            Ok(true)
+        }
+        ["/task", rest @ ..] => {
+            if rest.is_empty() {
+                println!("{}", theme.muted("usage: /task <teks tugas>"));
+                return Ok(true);
+            }
+            let text = rest.join(" ");
+            match aicli_core::store::task_add(&ctx.paths.data_dir, &text, None) {
+                Ok(t) => println!(
+                    "{}",
+                    theme.success(&format!("tugas {} tersimpan: {}", t.id, t.text))
+                ),
+                Err(e) => println!("{}", theme.danger(&format!("gagal: {e}"))),
+            }
             Ok(true)
         }
         ["/plain"] => {
@@ -958,6 +1045,12 @@ async fn handle_slash(
         _ => {
             let known = [
                 "/help",
+                "/whoami",
+                "/ask",
+                "/code",
+                "/shell",
+                "/daily",
+                "/task",
                 "/new",
                 "/sessions",
                 "/open",

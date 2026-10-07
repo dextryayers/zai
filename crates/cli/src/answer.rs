@@ -1,7 +1,9 @@
 /// Single answer router shared by TUI, classic REPL, and one shot ask.
-/// Order is cheapest first: local brain, then Ollama daemon, then local
-/// GGUF through llama-cli, then mock fallback. Real model text never
-/// carries code fences or citations unless the model wrote them.
+/// Professional order: real model first (Ollama, then local GGUF), offline
+/// brain only as fallback when no model is reachable. Language follows the
+/// user (Indonesian vs English) dynamically - never a single hardcoded reply.
+/// Identity is enforced via system prompt; a guardrail only patches a wrong
+/// model identity instead of replacing the whole answer.
 use crate::Ctx;
 use std::sync::atomic::AtomicBool;
 
@@ -33,78 +35,213 @@ pub fn compose_answer(
     n_ctx: u32,
     cancel: &AtomicBool,
 ) -> Answer {
-    if let Some(section) = aicli_infer::brain::compose(query) {
-        return Answer {
-            text: section.body_md,
-            brain: Some(section.kind),
-            backend_note: "local brain, no model needed".to_string(),
-        };
-    }
+    let lang = aicli_infer::lang::detect(query);
+    let localized_system = aicli_infer::lang::system_for(lang);
+    let is_identity = aicli_infer::brain::identity::is_identity_query(query);
+
+    // 1. Real model first: Ollama daemon when an ollama/ model is selected.
     if let Some(omodel) = aicli_models::ollama::strip_id(model_id) {
-        let note = if aicli_models::ollama::daemon_reachable() {
-            format!("ollama {omodel} via localhost:11434")
-        } else {
-            "ollama daemon down, start with: ollama serve".to_string()
-        };
-        match aicli_models::ollama::generate(omodel, prompt, ctx.config.model.timeout_s) {
-            Ok(text) => {
-                return Answer {
-                    text,
-                    brain: None,
-                    backend_note: note,
-                };
-            }
-            Err(e) => {
-                return Answer {
-                    text: format!(
-                        "{}\n\n> ollama failed ({e}), fell back to local mock. Start the daemon with `ollama serve` or pick a GGUF model with `/model`.",
-                        aicli_infer::sampler::mock_answer_with_sampler(query, sampler)
-                    ),
-                    brain: Some("ollama-fallback".to_string()),
-                    backend_note: note,
-                };
+        if aicli_models::ollama::daemon_reachable() {
+            // Rebuild prompt with localized identity-enforcing system.
+            let localized_prompt = rebuild_with_system(prompt, &localized_system, parts.system);
+            match aicli_models::ollama::generate(
+                omodel,
+                &localized_prompt,
+                ctx.config.model.timeout_s,
+            ) {
+                Ok(text) => {
+                    let text = guard_identity(is_identity, &text, query);
+                    return Answer {
+                        text,
+                        brain: None,
+                        backend_note: format!("ollama {omodel} via localhost:11434"),
+                    };
+                }
+                Err(e) => {
+                    // Model failed: fall through to brain fallback below,
+                    // but keep the error visible in the note.
+                    let fb = brain_fallback(query, sampler, model_id, Some(&e.to_string()));
+                    return Answer {
+                        text: fb.0,
+                        brain: Some(fb.1),
+                        backend_note: format!("ollama {omodel} failed ({e}), offline fallback"),
+                    };
+                }
             }
         }
+        // Daemon down: offline fallback, language-aware.
+        let fb = brain_fallback(query, sampler, model_id, None);
+        return Answer {
+            text: fb.0,
+            brain: Some(fb.1),
+            backend_note: "ollama daemon down, start with: ollama serve - offline fallback"
+                .to_string(),
+        };
     }
-    // Cached GGUF runs real local inference through llama-cli.
+
+    // 2. Real model: cached GGUF through llama server/cli.
     let entry = aicli_models::find_any(&ctx.paths.models_dir, model_id);
     let path = entry
         .as_ref()
         .map(|e| aicli_models::local_path(&ctx.paths.models_dir, e));
     let usable = path.as_ref().map(|p| p.exists()).unwrap_or(false);
-    if !usable {
-        return Answer {
-            text: aicli_infer::sampler::mock_answer_with_sampler(query, sampler),
-            brain: None,
-            backend_note: format!("mock backend, pull with: zai models pull {model_id}"),
-        };
+    if usable {
+        let path = path.unwrap();
+        let entry_name = entry.as_ref().map(|e| e.file.clone()).unwrap_or_default();
+        if aicli_infer::load_info(
+            &path,
+            n_ctx,
+            ctx.config.model.n_threads,
+            ctx.config.model.n_gpu_layers,
+        )
+        .is_ok()
+        {
+            let entry_ctx = entry
+                .and_then(|e| if e.n_ctx > 0 { Some(e.n_ctx) } else { None })
+                .unwrap_or(n_ctx);
+            let timeout = std::time::Duration::from_secs(ctx.config.model.timeout_s.max(10));
+            let threads = aicli_infer::local::inference_threads(ctx.config.model.n_threads);
+            // Localized system with identity for the model.
+            let localized_parts = AskParts {
+                system: &localized_system,
+                chunks: parts.chunks,
+                history: parts.history,
+            };
+            if let Some(text) = try_server_answer(
+                &path,
+                entry_ctx,
+                &localized_parts,
+                query,
+                sampler,
+                threads,
+                timeout,
+                cancel,
+            ) {
+                let text = guard_identity(is_identity, &text, query);
+                let tok = aicli_infer::estimate_tokens(&text);
+                return Answer {
+                    text,
+                    brain: None,
+                    backend_note: format!("local {entry_name} · {tok} tok · server"),
+                };
+            }
+            let system_full = build_system(&localized_system, parts.chunks);
+            let user_full = build_user(parts.history, query);
+            let req = aicli_infer::GenRequest {
+                model_path: path,
+                system: system_full,
+                user: user_full,
+                temp: sampler.temp,
+                top_p: sampler.top_p,
+                seed: sampler.seed,
+                n_ctx: entry_ctx,
+                repeat_penalty: 1.1,
+                n_predict: aicli_infer::N_PREDICT,
+                threads,
+                timeout,
+            };
+            match aicli_infer::generate_local(&req, cancel) {
+                Ok(text) => {
+                    let text = guard_identity(is_identity, &text, query);
+                    let tok = aicli_infer::estimate_tokens(&text);
+                    return Answer {
+                        text,
+                        brain: None,
+                        backend_note: format!("local {entry_name} · {tok} tok · cli"),
+                    };
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    let fb = brain_fallback(query, sampler, model_id, Some(&msg));
+                    let hint = if msg.contains("no llama-cli") {
+                        "run: zai backend setup"
+                    } else {
+                        "offline fallback"
+                    };
+                    return Answer {
+                        text: fb.0,
+                        brain: Some(fb.1),
+                        backend_note: format!("local backend failed ({msg}), {hint}"),
+                    };
+                }
+            }
+        }
     }
-    let path = path.unwrap();
-    let entry_name = entry.as_ref().map(|e| e.file.clone()).unwrap_or_default();
-    // Header plus OOM validation first, same gate as the old mock path.
-    if let Err(e) = aicli_infer::load_info(
-        &path,
-        n_ctx,
-        ctx.config.model.n_threads,
-        ctx.config.model.n_gpu_layers,
-    ) {
-        return Answer {
-            text: aicli_infer::sampler::mock_answer_with_sampler(query, sampler),
-            brain: None,
-            backend_note: format!("backend warn: {e}"),
-        };
+
+    // 3. No model reachable: dynamic offline brain (language-aware synthesis,
+    //    never one fixed hardcoded string for everything).
+    let fb = brain_fallback(query, sampler, model_id, None);
+    Answer {
+        text: fb.0,
+        brain: Some(fb.1),
+        backend_note: format!(
+            "offline fallback (no model cached), pull with: zai models pull {model_id} - lang {lang}"
+        ),
     }
-    let mut system_full = parts.system.to_string();
-    for (i, c) in parts.chunks.iter().enumerate() {
-        system_full.push_str(&format!("\n[SOURCE {}] {c}", i + 1));
+}
+
+/// Offline fallback: brain synthesis when it can, else language-aware mock.
+fn brain_fallback(
+    query: &str,
+    sampler: &aicli_infer::SamplerConfig,
+    _model_id: &str,
+    _cause: Option<&str>,
+) -> (String, String) {
+    if let Some(section) = aicli_infer::brain::compose(query) {
+        return (section.body_md, section.kind);
     }
-    // History already holds the current question in chat flows (the user
-    // turn persists at submit time). Drop that trailing duplicate so the
-    // model sees the question once, not twice, and never echoes it back
-    // as if it were the answer.
-    let mut user_full = String::new();
-    let hist: Vec<(String, String)> = parts
-        .history
+    let lang = aicli_infer::lang::detect(query);
+    let mock = aicli_infer::sampler::mock_answer_with_sampler(query, sampler);
+    let localized = if lang == "id" {
+        format!(
+            "{mock}\n\n> Mode offline tanpa model. Untuk jawaban penuh dari model: `zai models pull <id>` atau jalankan `ollama serve`. Pertanyaan matematika, review kode, panduan defensif, dan `/code` tetap dijawab offline."
+        )
+    } else {
+        format!(
+            "{mock}\n\n> Offline with no model cached. For full model answers: `zai models pull <id>` or run `ollama serve`."
+        )
+    };
+    (localized, "mock-fallback".to_string())
+}
+
+/// Identity guardrail: if the user asked identity and the model answer does
+/// not mention the developer, append a one-line correction dynamically.
+/// Never replaces a correct model answer with a hardcoded block.
+fn guard_identity(is_identity: bool, text: &str, query: &str) -> String {
+    if !is_identity {
+        return text.to_string();
+    }
+    let low = text.to_lowercase();
+    if low.contains("hanif") {
+        return text.to_string();
+    }
+    let lang = aicli_infer::lang::detect(query);
+    let correction = if lang == "en" {
+        "\n\n> Correction: I am Zai, developed by Hanif Abdurrohim, a young Informatics Engineering student."
+    } else {
+        "\n\n> Koreksi identitas: Saya Zai yang dikembangkan oleh Hanif Abdurrohim, anak muda Teknik Informatika."
+    };
+    format!("{text}{correction}")
+}
+
+fn rebuild_with_system(prompt: &str, new_system: &str, old_system: &str) -> String {
+    if prompt.contains(old_system) {
+        prompt.replacen(old_system, new_system, 1)
+    } else {
+        format!("System: {new_system}\n\n{prompt}")
+    }
+}
+
+fn build_system(system: &str, chunks: &[String]) -> String {
+    let mut out = system.to_string();
+    for (i, c) in chunks.iter().enumerate() {
+        out.push_str(&format!("\n[SOURCE {}] {c}", i + 1));
+    }
+    out
+}
+
+fn build_user(history: &[(String, String)], query: &str) -> String {
+    let hist: Vec<(String, String)> = history
         .iter()
         .take(7)
         .map(|(r, c)| (r.clone(), c.clone()))
@@ -113,64 +250,12 @@ pub fn compose_answer(
         Some((r, c)) if r == "user" && c == query => &hist[..hist.len() - 1],
         _ => &hist[..],
     };
+    let mut out = String::new();
     for (r, c) in hist {
-        user_full.push_str(&format!("{r}: {c}\n"));
+        out.push_str(&format!("{r}: {c}\n"));
     }
-    user_full.push_str(query);
-    let entry_ctx = entry
-        .and_then(|e| if e.n_ctx > 0 { Some(e.n_ctx) } else { None })
-        .unwrap_or(n_ctx);
-    let timeout = std::time::Duration::from_secs(ctx.config.model.timeout_s.max(10));
-    let threads = aicli_infer::local::inference_threads(ctx.config.model.n_threads);
-    // Fast path: persistent server keeps weights loaded, answers land in
-    // seconds. It starts itself on first use when the binary exists.
-    let server_text = try_server_answer(
-        &path, entry_ctx, parts, query, sampler, threads, timeout, cancel,
-    );
-    if let Some(text) = server_text {
-        let tok = aicli_infer::estimate_tokens(&text);
-        return Answer {
-            text,
-            brain: None,
-            backend_note: format!("local {entry_name} · {tok} tok · server"),
-        };
-    }
-    let req = aicli_infer::GenRequest {
-        model_path: path,
-        system: system_full,
-        user: user_full,
-        temp: sampler.temp,
-        top_p: sampler.top_p,
-        seed: sampler.seed,
-        n_ctx: entry_ctx,
-        repeat_penalty: 1.1,
-        n_predict: aicli_infer::N_PREDICT,
-        threads,
-        timeout,
-    };
-    match aicli_infer::generate_local(&req, cancel) {
-        Ok(text) => {
-            let tok = aicli_infer::estimate_tokens(&text);
-            Answer {
-                text,
-                brain: None,
-                backend_note: format!("local {entry_name} · {tok} tok · cli"),
-            }
-        }
-        Err(e) => {
-            let msg = e.to_string();
-            let hint = if msg.contains("no llama-cli") {
-                "run: zai backend setup".to_string()
-            } else {
-                "fell back to mock".to_string()
-            };
-            Answer {
-                text: aicli_infer::sampler::mock_answer_with_sampler(query, sampler),
-                brain: None,
-                backend_note: format!("local backend failed ({msg}), {hint}"),
-            }
-        }
-    }
+    out.push_str(query);
+    out
 }
 
 /// Persistent server attempt. Returns Some on real model text, None to

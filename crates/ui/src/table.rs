@@ -3,6 +3,7 @@ use crate::theme::Theme;
 /// Render a table with header plus rows.
 /// Numeric columns right aligned when `align_right[i]` is true.
 /// Long paths truncate from left to keep filename visible.
+/// Premium: bold cyan header, subtle separators, padded cells.
 pub fn render_table(
     theme: &Theme,
     headers: &[&str],
@@ -43,16 +44,27 @@ pub fn render_table(
     );
     out.push_str(&theme.muted(&sep));
     out.push('\n');
-    // Header
+    // Header premium: cyan bold, uppercase preserved as given.
     out.push_str(&theme.muted(v_line));
     for (i, h) in headers.iter().enumerate() {
         let cell = format!(" {:<w$} ", h, w = widths[i]);
-        out.push_str(&theme.bold(&cell));
+        out.push_str(&theme.accent(&cell));
         out.push_str(&theme.muted(v_line));
     }
     out.push('\n');
     out.push_str(&theme.muted(&sep));
     out.push('\n');
+    if rows.is_empty() {
+        out.push_str(&theme.muted(v_line));
+        let msg = format!(
+            " {:<w$} ",
+            "(empty) - nothing to show",
+            w = widths.iter().sum::<usize>() + (cols.saturating_sub(1)) * 3
+        );
+        out.push_str(&theme.muted(&msg));
+        out.push_str(&theme.muted(v_line));
+        out.push('\n');
+    }
     for r in rows {
         out.push_str(&theme.muted(v_line));
         for (i, w) in widths.iter().enumerate().take(cols) {
@@ -63,7 +75,12 @@ pub fn render_table(
             } else {
                 cell = format!(" {:<w$} ", cell, w = *w);
             }
-            out.push_str(&cell);
+            // Numeric-looking cells muted for scanability, paths plain.
+            if align_right.get(i).copied().unwrap_or(false) {
+                out.push_str(&theme.muted(&cell));
+            } else {
+                out.push_str(&cell);
+            }
             out.push_str(&theme.muted(v_line));
         }
         out.push('\n');

@@ -3,9 +3,11 @@ use crate::theme::Theme;
 /// Minimal markdown subset for terminal chat:
 /// headings, lists, code fences with language tag, inline code, bold, links as footnotes.
 /// Must never panic on malformed input and must run under 50 ms per fixture.
+/// Code fences get light syntax tint for rust/python/js/ts/go/bash/toml/json.
 pub fn render_markdown(theme: &Theme, input: &str) -> String {
     let mut out = String::new();
     let mut in_code = false;
+    let mut code_lang = String::new();
     let mut footnotes: Vec<String> = Vec::new();
 
     for raw in input.lines() {
@@ -18,22 +20,25 @@ pub fn render_markdown(theme: &Theme, input: &str) -> String {
                     .trim_start_matches("```")
                     .trim()
                     .to_string();
+                code_lang = lang.clone();
                 let tag = if lang.is_empty() {
                     "code".to_string()
                 } else {
                     lang
                 };
-                out.push_str(&theme.muted(&format!("┌─ {tag}")));
+                out.push_str(&theme.muted(&format!("┌─ {tag} ── copy: select + Ctrl+Shift+C")));
                 out.push('\n');
             } else {
                 in_code = false;
+                code_lang.clear();
                 out.push_str(&theme.muted("└─"));
                 out.push('\n');
             }
             continue;
         }
         if in_code {
-            out.push_str(&format!("│ {line}\n"));
+            out.push_str(&highlight_code_line(theme, line, &code_lang));
+            out.push('\n');
             continue;
         }
         let t = line.trim_start();
@@ -136,6 +141,80 @@ fn render_spans(theme: &Theme, s: &str) -> String {
     // Fix unused mut warning path: chars never mutated after build.
     let _ = &mut chars;
     out
+}
+
+/// Lightweight code tint: comments muted, strings green, keywords cyan.
+/// Falls back to plain gutter when theme has no color. Never panics.
+fn highlight_code_line(theme: &Theme, line: &str, lang: &str) -> String {
+    let gutter = theme.muted("│ ");
+    if !theme.color {
+        return format!("{gutter}{line}");
+    }
+    let trimmed = line.trim_start();
+    // Full-line comments muted.
+    if trimmed.starts_with("//")
+        || trimmed.starts_with('#')
+        || trimmed.starts_with("--")
+        || trimmed.starts_with(';')
+    {
+        return format!("{gutter}{}", theme.muted(line));
+    }
+    // Keyword tint per language family.
+    let keywords: &[&str] = match lang {
+        "rust" | "rs" => &[
+            "fn", "let", "mut", "pub", "struct", "enum", "impl", "use", "mod", "return", "if",
+            "else", "for", "while", "match", "use",
+        ],
+        "python" | "py" => &[
+            "def", "class", "import", "from", "return", "if", "else", "elif", "for", "while",
+            "with", "as", "try", "except",
+        ],
+        "javascript" | "typescript" | "js" | "ts" => &[
+            "function", "const", "let", "var", "return", "if", "else", "for", "while", "import",
+            "export", "await", "async",
+        ],
+        "go" => &[
+            "func", "package", "import", "return", "if", "else", "for", "range", "var", "const",
+            "type",
+        ],
+        "bash" | "sh" => &[
+            "if", "then", "else", "fi", "for", "do", "done", "function", "echo", "exit",
+        ],
+        _ => &[],
+    };
+    // Fast path: tint only the first keyword occurrence at word boundary.
+    let mut out_line = line.to_string();
+    for kw in keywords {
+        let with_space = format!(" {kw} ");
+        if let Some(pos) = out_line.find(&with_space) {
+            let (head, tail) = out_line.split_at(pos);
+            let tail = tail.replacen(kw, &theme.accent(kw), 1);
+            out_line = format!("{head}{tail}");
+            break;
+        }
+        if out_line.starts_with(&format!("{kw} ")) {
+            out_line = out_line.replacen(kw, &theme.accent(kw), 1);
+            break;
+        }
+    }
+    // Strings: tint first quoted segment green when present.
+    if let Some(s) = tint_first_string(theme, &out_line) {
+        out_line = s;
+    }
+    format!("{gutter}{out_line}")
+}
+
+fn tint_first_string(theme: &Theme, line: &str) -> Option<String> {
+    for q in ['"', '\''] {
+        if let Some(a) = line.find(q) {
+            if let Some(rel) = line[a + 1..].find(q) {
+                let b = a + 1 + rel;
+                let inner = &line[a..=b];
+                return Some(line.replacen(inner, &theme.ok(inner), 1));
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
